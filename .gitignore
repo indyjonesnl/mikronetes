@@ -1,0 +1,5 @@
+# Local clone of k0s for reference only — not part of this repo
+/upstream/
+
+# Rust
+/target/

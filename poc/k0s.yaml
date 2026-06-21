@@ -1,0 +1,17 @@
+# Baseline k0s config for the mikronetes PoC harness.
+# This runs REAL k0s in two containers as a known-good starting point we can
+# iterate on. The mikronetes Rust stack will replace k0s here, component by
+# component, while this same compose harness + smoke test stays the contract.
+#
+# Memory choices (the whole point — fit 512 MB/node):
+#   - storage.type: kine  -> SQLite, NOT etcd (see docs/k0s-memory-research.md)
+#   - metrics-server disabled -> saves ~30-60Mi, not needed for the PoC
+apiVersion: k0s.k0sproject.io/v1beta1
+kind: ClusterConfig
+metadata:
+  name: mikronetes-poc
+spec:
+  storage:
+    type: kine
+    kine:
+      dataSource: "sqlite:///var/lib/k0s/db/state.db?mode=rwc&_journal=WAL"
