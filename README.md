@@ -1,5 +1,7 @@
 # mikronetes
 
+[![smoke-test](https://github.com/indyjonesnl/mikronetes/actions/workflows/smoke.yml/badge.svg)](https://github.com/indyjonesnl/mikronetes/actions/workflows/smoke.yml)
+
 **A Talos-style Kubernetes distribution for 512 MB devices.**
 
 One Rust stack that turns cheap, RAM-starved single-board computers into a real
