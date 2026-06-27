@@ -12,20 +12,19 @@
 #   There is no Bollard/Docker path in new_with_eviction. Setting
 #   CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock is sufficient.
 #
-# Note on GHCR images: the all-in-one binary is NOT in
-#   ghcr.io/indyjonesnl/rusternetes/api-server:main (that image carries
-#   /app/api-server only). The all-in-one image is rusternetes-rusternetes:latest
-#   (built locally from Dockerfile.all-in-one) — this probe uses it.
+# Note on the all-in-one image: there is NO GHCR all-in-one image. The binary
+# is built from Dockerfile.all-in-one (plan task C2 automates this). The probe
+# image rusternetes-aio-probe:cri is a minimal Debian wrapper around the binary
+# compiled from crates/rusternetes/ at HEAD.
 #
 # Usage: bash scripts/m2a-allinone-probe.sh
 # Expected: PASS: all-in-one embedded kubelet + containerd-rs + flannel ran a pod
 set -euo pipefail
 
 M1="${RUSTERNETES_M1:-/home/jones/PhpstormProjects/rusternetes-m1}"
-# Default to the CRI-capable probe image (built from HEAD source,
-# crates/kubelet CONTAINER_RUNTIME_ENDPOINT path, no Bollard).
-# rusternetes-rusternetes:latest was built before the CRI-only migration
-# and still has Bollard; rusternetes-aio-probe:cri is current HEAD.
+# CRI-capable all-in-one image built from HEAD source (Dockerfile.all-in-one).
+# rusternetes-rusternetes:latest was built before the CRI-only kubelet migration
+# and still has Bollard; rusternetes-aio-probe:cri is built from current HEAD.
 AIO_IMAGE="${AIO_IMAGE:-rusternetes-aio-probe:cri}"
 say(){ printf '\n==> %s\n' "$*"; }
 die(){ printf '\nFAIL: %s\n' "$*" >&2
@@ -173,11 +172,20 @@ done
 STATUS="$(kc get node node-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo)"
 [ "${STATUS}" = "True" ] || die "node-1 not Ready after 5 min"
 
+# Hard-assert the embedded kubelet is actually using containerd-rs.
+# Without this, a silent fallback to a different runtime would still make
+# the node Ready while the CRI path is broken.
+rt="$(kc get node node-1 -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}' 2>/dev/null || echo)"
+case "$rt" in
+  *containerd-rs*) say "runtime confirmed: ${rt}" ;;
+  *) die "node runtime is not containerd-rs (got: ${rt})" ;;
+esac
+
 say "applying flannel-rs DaemonSet"
-kc apply -f "${M1}/deploy/flannel/flannel-rs.yaml" 2>&1 || true
+kc apply -f "${M1}/deploy/flannel/flannel-rs.yaml" || die "flannel apply failed"
 
 say "running probe pod (traefik/whoami)"
-kc run probe --image=traefik/whoami:v1.10.2 >/dev/null 2>&1 || true
+kc run probe --image=traefik/whoami:v1.10.2
 
 say "waiting for probe pod Running (up to 5 min)"
 for i in $(seq 1 60); do
