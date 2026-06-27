@@ -60,6 +60,14 @@ cd "$RUSTERNETES_M1"
 export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-$RUSTERNETES_M1/.rusternetes/volumes}"
 mkdir -p "$KUBELET_VOLUMES_PATH"
 
+# Pre-create every .rusternetes/ dir the compose bind-mounts, owned by THIS user,
+# BEFORE `docker compose up`. Otherwise the docker daemon creates a missing
+# bind-mount source dir as root, and the (non-root) bootstrap step then can't
+# write its templated static-pod manifests into .rusternetes/manifests
+# ("Permission denied"). The dev box masked this because the dirs already
+# existed from prior runs; a clean checkout/CI does not.
+mkdir -p "$RUSTERNETES_M1/.rusternetes/manifests" "$RUSTERNETES_M1/.rusternetes/certs"
+
 # 1. Build the node-cdrs image if missing (Task 1 recipe, from repo root).
 if ! docker image inspect "$NODE_IMAGE" >/dev/null 2>&1; then
   say "node image $NODE_IMAGE missing — building (deploy/node-cdrs/Dockerfile)"
@@ -153,11 +161,16 @@ say "waiting for data plane to converge (flannel ready + subnet.env + Service ro
 converged=0
 ready=0; want=0; subnet1=""; subnet2=""; svc=""
 for _ in $(seq 1 90); do
+  # NB: every probe here MUST be set -e-safe — the script runs `set -e`, and
+  # these commands legitimately return non-zero before convergence (DS absent,
+  # subnet.env not written yet, Service IP not routed). Without the trailing
+  # `|| true` a failing command-substitution assignment aborts the whole script
+  # mid-wait (no converged, no die — just a silent exit 1).
   ready=$("$KCTL_WRAP" get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
   want=$("$KCTL_WRAP" get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
-  subnet1=$(docker exec "$NODE1_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y' 2>/dev/null)
-  subnet2=$(docker exec "$NODE2_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y' 2>/dev/null)
-  svc=$(docker exec "$NODE1_CTR" sh -c 'curl -sk --max-time 3 -o /dev/null -w "%{http_code}" https://10.96.0.1:443/healthz 2>/dev/null' 2>/dev/null)
+  subnet1=$(docker exec "$NODE1_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y || echo no' 2>/dev/null || echo no)
+  subnet2=$(docker exec "$NODE2_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y || echo no' 2>/dev/null || echo no)
+  svc=$(docker exec "$NODE1_CTR" sh -c 'curl -sk --max-time 3 -o /dev/null -w "%{http_code}" https://10.96.0.1:443/healthz 2>/dev/null || true' 2>/dev/null || echo 000)
   if [ "${want:-0}" -ge 2 ] 2>/dev/null && [ "$ready" = "$want" ] \
      && [ "$subnet1" = y ] && [ "$subnet2" = y ] && [ "$svc" = 200 ]; then
     converged=1; break
