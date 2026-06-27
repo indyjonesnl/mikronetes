@@ -234,6 +234,63 @@ CI.
 - A recorded 512 MiB per-component memory breakdown.
 - A green local M2a run (and CI if the runner supports KVM).
 
+## Addendum — decisions from plan-time research (2026-06-27)
+
+Reading the four repos + the live Dallas cluster refined several points above.
+Where this addendum and the body differ, **the addendum wins**.
+
+- **VM backend = QEMU-TCG in CI + Cloud Hypervisor locally**, selected by a
+  `--backend qemu|ch` flag in the harness. The Dallas Spot ARC nodes expose **no
+  `/dev/kvm`** (no `vmx`/`svm` even in a privileged pod — verified), and Cloud
+  Hypervisor is KVM-only with no emulation fallback. QEMU-TCG boots the *same*
+  M2a image (kernel + initramfs + disk) with `-m 512` (the RAM cap is real under
+  TCG; only the CPU is emulated), giving a green-on-push CI boot+fit gate now.
+  CH remains the North Star VMM — verified locally on the dev box (has
+  `/dev/kvm`) and the documented production launch path; it moves into CI once a
+  KVM-capable runner exists. machined-rs already boot-tests under QEMU-TCG, so
+  the QEMU path reuses a proven harness.
+- **The node uses the all-in-one's *embedded* kubelet — no separate kubelet
+  service.** `rusternetes` (the all-in-one) already runs api-server + scheduler
+  + controller-manager + storage **+ an embedded kubelet + kube-proxy** in one
+  process, and its embedded kubelet defaults to `PodNetworkMode::Cni` (drives an
+  external CRI). So machined supervises exactly two payload units: the
+  containerd-rs **runtime** and the **all-in-one** (in CNI mode). Running a
+  second kubelet would fight the embedded one.
+- **flannel-rs stays a DaemonSet applied post-boot** (as in M1), *not* a machined
+  service. flannel-rs has no `--kubeconfig` flag — it auto-detects an in-cluster
+  ServiceAccount token, which a bare machined service wouldn't have. The
+  DaemonSet (hostNetwork, needs no CNI to start) is the lower-divergence path and
+  reuses M1's working `deploy/flannel/flannel-rs.yaml`.
+- **Two confirmed machined-rs gaps to fix upstream-faithfully (TDD):**
+  1. `ServiceConfig` has **no `env`** field, but the all-in-one's embedded
+     kubelet reads `CONTAINER_RUNTIME_ENDPOINT` from the environment (it is not a
+     CLI flag). Add `env` to `ServiceConfig`.
+  2. machined's `runtime:` block **generates an upstream-containerd v3
+     `config.toml`** (`containerd_config_toml`) and passes `--config` to the
+     binary; **containerd-rs uses its own config schema**. Add a "bring-your-own
+     config" knob so machined supervises `containerd-rs --config <baked>` and
+     CRI-health-probes its socket **without** overwriting the baked config. This
+     preserves machined's `RuntimeReady` gating (the embedded kubelet then waits
+     for a genuinely-ready CRI — avoids the M1 startup race).
+- **Payload is delivered through the imager's existing artifact-staging system**
+  (artifact kinds `boot-binary` / `boot-tarball` / `cni-plugins`, which land
+  files on the FAT `/boot` partition at `/boot/bin/*`, `/boot/cni/bin`), plus a
+  small **`--overlay <dir>`** flag for the mikronetes-specific files
+  (`/boot/config.yaml`, the baked containerd-rs config, certs). The **boot disk
+  is the imager's own GPT image** (which carries `/boot` *and* free space
+  machined provisions as STATE+EPHEMERAL) — not a separate blank disk. The
+  QEMU/CH launch is `--kernel vmlinuz --initramfs initramfs.img` (from the
+  imager's `--emit-boot`) **plus** `--disk <image>`, exactly mirroring
+  machined-rs's existing aarch64 boot test.
+- **Pinned artifact versions:** Cloud Hypervisor `v52.0`
+  (`cloud-hypervisor-static`); crun `v1.28` static; CNI plugins `v1.9.1`
+  (`bridge`/`host-local`/`loopback`/`portmap`); flannel CNI plugin
+  `v1.9.1-flannel1`. (The M1 `node-cdrs` image already vendors CNI `v1.6.2` +
+  crun-as-runc; reuse if simpler.) GHCR binaries are extracted from the public
+  images via `docker create` + `docker cp`: `rusternetes` at `/app/rusternetes`
+  (in the `api-server` image), `kubelet` at `/app/kubelet`, containerd-rs from
+  the baked `deploy/node-cdrs/bin/containerd-rs`.
+
 ## Out of scope (M2a)
 
 - Multiple VMs, cross-VM flannel VXLAN, a bridged multi-node LAN (→ M2b).
