@@ -395,10 +395,18 @@ set -euo pipefail
 GHCR="ghcr.io/indyjonesnl/rusternetes"; TAG="${IMAGE_TAG:-main}"
 M1="${RUSTERNETES_M1:-/home/jones/PhpstormProjects/rusternetes-m1}"
 OUT="${OUT:-$(pwd)/out/overlay}"
-rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/cni/bin" "$OUT/pki"
+rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/cni/bin" "$OUT/cni/conf" "$OUT/pki"
 
-# rusternetes all-in-one from GHCR api-server image (/app/rusternetes).
-cid=$(docker create "${GHCR}/api-server:${TAG}"); docker cp "$cid:/app/rusternetes" "$OUT/bin/rusternetes"; docker rm "$cid" >/dev/null
+# rusternetes all-in-one — BUILD FROM SOURCE. (A1 finding: there is NO GHCR
+# all-in-one image — ghcr api-server only carries /app/api-server. The all-in-one
+# binary /app/rusternetes is produced ONLY by Dockerfile.all-in-one.)
+# IMPLEMENTER: read the header of "$M1/Dockerfile.all-in-one" — it documents the
+# exact build context (the PARENT dir of the rusternetes/ checkout, because it
+# vendors rhino at rusternetes/rhino). Build with that context, then docker-cp
+# /app/rusternetes out. Cache the image (skip rebuild when present) for speed.
+docker image inspect mikronetes-aio:m2a >/dev/null 2>&1 || \
+  docker build -f "$M1/Dockerfile.all-in-one" -t mikronetes-aio:m2a <BUILD_CONTEXT_PER_DOCKERFILE_HEADER>
+cid=$(docker create mikronetes-aio:m2a); docker cp "$cid:/app/rusternetes" "$OUT/bin/rusternetes"; docker rm "$cid" >/dev/null
 # containerd-rs from the baked node-cdrs binary.
 install -m0755 "$M1/deploy/node-cdrs/bin/containerd-rs" "$OUT/bin/containerd-rs"
 # crun (static) + runc symlink (containerd-rs execs "runc").
@@ -410,6 +418,17 @@ curl -fsSL https://github.com/containernetworking/plugins/releases/download/v1.9
 cp "$tmp"/{bridge,host-local,loopback,portmap} "$OUT/cni/bin/"
 curl -fsSL https://github.com/flannel-io/cni-plugin/releases/download/v1.9.1-flannel1/cni-plugin-flannel-linux-amd64-v1.9.1.tgz | tar -xz -C "$tmp"
 cp "$tmp/cni-plugin" "$OUT/cni/bin/flannel"; rm -rf "$tmp"
+# Bootstrap CNI conflist (A1 finding: containerd-rs v0.1.3 invokes CNI for EVERY
+# RunPodSandbox, incl hostNetwork=true — without a conflist in cni_conf_dir at
+# boot, the all-in-one's first sandboxes ALL fail). Bake a minimal bridge
+# conflist at /boot/cni/conf so boot-time sandboxes (incl the flannel DS pod
+# itself) succeed before flannel installs its own.
+cat > "$OUT/cni/conf/10-bootstrap-bridge.conflist" <<'JSON'
+{ "cniVersion": "0.3.1", "name": "bootstrap", "plugins": [
+  { "type": "bridge", "bridge": "cni0", "isGateway": true, "ipMasq": true,
+    "ipam": { "type": "host-local", "subnet": "10.244.0.0/24",
+              "routes": [ { "dst": "0.0.0.0/0" } ] } } ] }
+JSON
 # machine config + containerd-rs config (from deploy/m2a, created in Task D1).
 cp deploy/m2a/config.yaml "$OUT/config.yaml"
 cp deploy/m2a/config-containerd-rs.toml "$OUT/config-containerd-rs.toml"
@@ -432,11 +451,17 @@ default_runtime_name = "runc"
 runtime_type = "io.containerd.runc.v2"
 snapshotter = "overlayfs"
 systemd_cgroup = false
-cni_conf_dir = "/etc/cni/net.d"
+cni_conf_dir = "/boot/cni/conf"
 cni_bin_dir = "/boot/cni/bin"
 ```
 
-(`cni_bin_dir` points at the baked plugins; `runc` resolves via `PATH=/boot/bin` set on the runtime service env in Task D1.)
+(`cni_conf_dir`/`cni_bin_dir` point at the baked conflist + plugins on the FAT
+`/boot`, present at boot — see the bootstrap conflist above. `runc` resolves via
+`PATH=/boot/bin` set on the runtime service env in Task D1. **A1 follow-up for
+E2:** flannel-rs's DaemonSet writes its conflist to `/etc/cni/net.d` by default;
+for M2a, point its conf hostPath at `/boot/cni/conf` (or have containerd-rs watch
+both) so flannel's overlay conflist supersedes the bootstrap bridge once flannel
+converges — resolve empirically when E2 runs locally.)
 
 - [ ] **Step 3: Run it (deferred until D1 writes config.yaml) — partial run now**
 
@@ -491,26 +516,34 @@ machine:
     config_path: /boot/config-containerd-rs.toml   # baked → machined won't overwrite
   services:
     - id: rusternetes
+      # Argv/env are A1-PROVEN verbatim (the embedded kubelet drove containerd-rs
+      # with exactly these). --disable-dns: no CoreDNS needed for the M2a smoke.
       command:
         - /boot/bin/rusternetes
         - --storage-backend
         - sqlite
         - --data-dir
         - /var/lib/rusternetes/db
+        - --tls
         - --bind-address
         - 0.0.0.0:6443
-        - --tls
         - --node-name
         - node-1
+        - --skip-auth
+        - --disable-proxy        # A1 ran with this; E2 MUST re-enable (drop this line) if flannel needs the kubernetes Service ClusterIP route
+        - --disable-dns
       depends_on: [containerd]      # gated on CRI RuntimeReady (see boot.rs RuntimeReadiness)
       restart: always
       env:
         - { key: RUST_LOG, value: info }
+        - { key: RUST_MIN_STACK, value: "8388608" }
         - { key: PATH, value: "/boot/bin:/usr/bin:/bin" }
         - { key: CONTAINER_RUNTIME_ENDPOINT, value: "unix:///run/containerd-rs.sock" }
 ```
 
-(Argv/env must match what Task A1 printed as PROVEN. If A1 needed an extra flag for CNI mode, add it here verbatim.)
+(Argv/env above are exactly what Task A1 proved. **A1 open item:** flannel DS did
+not converge in the A1 container probe — E2 verifies flannel for real and, if the
+overlay needs the kubernetes Service ClusterIP, drops `--disable-proxy` here.)
 
 - [ ] **Step 2: Validate it parses (machined config loader)**
 
