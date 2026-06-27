@@ -197,9 +197,18 @@ machined-rs already has root-free fakes plus QEMU boot tests. Any machined-rs
 change (the `--overlay` flag; possibly an `env:` field on services, or readiness
 handling for non-CRI services) is built under TDD with unit tests there before
 use. The end-to-end gate is `m2a-up.sh` + `m2a-smoke.sh`, runnable locally and
-(stretch) in CI — CH boot in GitHub Actions needs nested virt/KVM, which the
-`ubuntu-latest` runners expose; the plan confirms this and falls back to
-local-only verification if a given runner does not.
+in CI.
+
+**CI runs on our self-hosted GitHub ARC runners** (Spot Rackspace, our own
+rented hardware), not GitHub-hosted runners. The ARC runner pods run
+**privileged**, so the CH launch has everything it needs from userspace —
+`NET_ADMIN` for the bridge/tap, loop devices for the imager — *provided the
+host exposes KVM*. The single thing to confirm (a plan task) is that
+**`/dev/kvm` is present and passable** into the runner pod (nested virt if the
+Spot nodes are VMs, native if bare metal). With that, M2a's end-to-end boot is a
+real CI gate, not a local-only stretch. If a given runner lacks `/dev/kvm`, fall
+back to local verification and gate only the unit-level machined-rs changes in
+CI.
 
 ## Risks
 
@@ -208,7 +217,11 @@ local-only verification if a given runner does not.
    use the all-in-one (not a split CP), measure early, trim the kernel config if
    needed. If it genuinely will not fit, report that as a finding rather than
    hiding it.
-2. **Cloud Hypervisor acquisition + KVM availability**, locally and in CI.
+2. **Cloud Hypervisor acquisition + KVM availability.** Acquired as a pinned
+   static binary. CI runs on our self-hosted, **privileged** GitHub ARC runners
+   (Spot Rackspace), which removes the GitHub-hosted-runner KVM uncertainty —
+   the only open check is that the runner host exposes `/dev/kvm` to the pod
+   (nested virt on VM nodes, native on bare metal).
 3. **machined-rs gaps** surfaced during the build (service `env`, ordering,
    readiness for non-CRI services). Fix upstream-faithfully in machined-rs with
    tests, mirroring the M1 containerd-rs / rusternetes gap work.
