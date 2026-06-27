@@ -68,7 +68,19 @@ else
   say "node image $NODE_IMAGE present — skipping build"
 fi
 
-# 2. Reconcile the compose stack (idempotent; no destructive teardown).
+# 2. Generate TLS certs + service kubeconfigs BEFORE compose up — the api-server
+#    (and scheduler/controller-manager/kube-proxy/nodes) mount
+#    ./.rusternetes/certs read-only and crash with "Failed to read certificate
+#    file" if they're absent. (On a dev box this was masked by certs left from a
+#    previous run; a clean checkout/CI has none.) Idempotent: regenerates each run.
+if [ -f scripts/generate-certs.sh ]; then
+  say "generating TLS certs + kubeconfigs (scripts/generate-certs.sh)"
+  bash scripts/generate-certs.sh
+else
+  die "scripts/generate-certs.sh not found in $RUSTERNETES_M1 — cannot provision certs"
+fi
+
+# 3. Reconcile the compose stack (idempotent; no destructive teardown).
 say "docker compose -f $COMPOSE_FILE up -d"
 docker compose -f "$COMPOSE_FILE" up -d
 
