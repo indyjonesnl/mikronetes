@@ -1,0 +1,45 @@
+# mikronetes M2a — single all-in-one node. machined supervises containerd-rs
+# (runtime, CRI-health-gated) + the rusternetes all-in-one (embedded kubelet in
+# CNI mode + embedded kube-proxy). flannel is applied post-boot as a DaemonSet.
+machine:
+  hostname: node-1
+  network:
+    interfaces:
+      - name: eth0
+        addresses: ["10.88.0.2/24"]
+        routes:
+          - via: 10.88.0.1
+    nameservers: [10.88.0.1]
+  install:
+    disk: /dev/vda
+    wipe: false
+  runtime:
+    disabled: false
+    binary: /boot/bin/containerd-rs
+    socket: /run/containerd-rs.sock
+    config_path: /boot/config-containerd-rs.toml   # baked → machined won't overwrite
+  services:
+    - id: rusternetes
+      # Argv/env are A1-PROVEN verbatim (the embedded kubelet drove containerd-rs
+      # with exactly these). --disable-dns: no CoreDNS needed for the M2a smoke.
+      command:
+        - /boot/bin/rusternetes
+        - --storage-backend
+        - sqlite
+        - --data-dir
+        - /var/lib/rusternetes/db
+        - --tls
+        - --bind-address
+        - 0.0.0.0:6443
+        - --node-name
+        - node-1
+        - --skip-auth
+        - --disable-proxy        # A1 ran with this; E2 MUST re-enable (drop this line) if flannel needs the kubernetes Service ClusterIP route
+        - --disable-dns
+      depends_on: [containerd]      # gated on CRI RuntimeReady (see boot.rs RuntimeReadiness)
+      restart: always
+      env:
+        - { key: RUST_LOG, value: info }
+        - { key: RUST_MIN_STACK, value: "8388608" }
+        - { key: PATH, value: "/boot/bin:/usr/bin:/bin" }
+        - { key: CONTAINER_RUNTIME_ENDPOINT, value: "unix:///run/containerd-rs.sock" }

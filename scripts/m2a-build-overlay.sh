@@ -114,7 +114,7 @@ JSON
 # config.yaml is written by Task D1; skip that copy until D1 is done.
 # config-containerd-rs.toml is created in this task, copy it now.
 # ---------------------------------------------------------------------------
-# cp deploy/m2a/config.yaml "$OUT/config.yaml"      # D1 not done yet — deferred
+cp "$REPO_ROOT/deploy/m2a/config.yaml" "$OUT/config.yaml"
 cp "$REPO_ROOT/deploy/m2a/config-containerd-rs.toml" "$OUT/config-containerd-rs.toml"
 
 echo ""
