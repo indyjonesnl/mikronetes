@@ -7,35 +7,29 @@ name: m1-rust-stack-smoke
 # containerd-rs runtime, a pod served cross-node over flannel-rs, plus a
 # per-component memory breakdown).
 #
-# The stack spans two repos: this one (mikronetes) holds the harness
-# (scripts/m1-up.sh + scripts/m1-smoke.sh); the rusternetes fork holds the
-# compose file, Dockerfiles, deploy/node-cdrs (with the baked containerd-rs
-# binary) and the rhino submodule. So the job checks rusternetes out alongside
-# and points the harness at it via RUSTERNETES_M1.
+# Build-free: the rusternetes fork is PUBLIC and publishes PUBLIC GHCR images
+# for the control-plane binaries, so this job PULLS them (no Rust compile, no
+# access token). The only image built here is the M1 node image (node-cdrs =
+# containerd-rs + crun + the kubelet binary from the GHCR kubelet image) — a
+# fast COPY-only build, since GHCR has no containerd-rs/crun node variant.
 #
-# REQUIRED SETUP (one-time):
-#   - Repo secret `RUSTERNETES_TOKEN`: a PAT/fine-grained token with read access
-#     to indyjonesnl/rusternetes AND its `rhino` submodule (indyjonesnl/rhino).
-#     Used only to check those repos out.
-#
-# Heavy job (full Rust workspace compile + 3-node compose), so it does NOT run
-# on every PR — only on pushes to main, a weekly schedule, and manual dispatch.
-# Override the rusternetes ref via the workflow_dispatch input.
+# The harness (scripts/m1-up.sh + scripts/m1-smoke.sh) lives here; the compose
+# file, deploy/node-cdrs Dockerfile + baked containerd-rs binary, flannel-rs
+# manifest and bootstrap script live in the rusternetes fork, which is checked
+# out alongside and pointed at via RUSTERNETES_M1.
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'scripts/m1-up.sh'
-      - 'scripts/m1-smoke.sh'
-      - 'scripts/mem-breakdown.*'
-      - '.github/workflows/m1-stack.yml'
-  schedule:
-    - cron: '0 6 * * 1'          # Mondays 06:00 UTC — catch drift in the fork
+  pull_request:
   workflow_dispatch:
     inputs:
       rusternetes_ref:
-        description: 'rusternetes fork ref to test'
+        description: 'rusternetes fork ref (compose/manifests/Dockerfiles)'
+        default: 'main'
+        required: false
+      image_tag:
+        description: 'GHCR image tag for the control-plane services'
         default: 'main'
         required: false
 
@@ -43,22 +37,24 @@ concurrency:
   group: m1-stack-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GHCR: ghcr.io/indyjonesnl/rusternetes
+  IMAGE_TAG: ${{ github.event.inputs.image_tag || 'main' }}
+
 jobs:
   m1-stack:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout mikronetes (the harness)
         uses: actions/checkout@v4
 
-      - name: Checkout rusternetes fork (compose + Dockerfiles + rhino submodule)
+      - name: Checkout rusternetes fork (compose + Dockerfiles + manifests; PUBLIC, no token)
         uses: actions/checkout@v4
         with:
           repository: indyjonesnl/rusternetes
           ref: ${{ github.event.inputs.rusternetes_ref || 'main' }}
           path: rusternetes-m1
-          submodules: recursive
-          token: ${{ secrets.RUSTERNETES_TOKEN }}
 
       - name: Environment
         run: |
@@ -73,22 +69,32 @@ jobs:
           chmod +x /usr/local/bin/kubectl
           kubectl version --client
 
-      - name: Build the Rust-stack images
+      - name: Pull GHCR control-plane images + tag to the compose's expected names
+        run: |
+          set -euxo pipefail
+          # Map the published GHCR images onto the local tags that
+          # compose.cdrs-flannel.yml references (it was authored for locally
+          # built images; retagging keeps it unchanged and skips the build).
+          declare -A MAP=(
+            [rhino]=rusternetes-rhino:latest
+            [api-server]=isolated-work-api-server:latest
+            [scheduler]=rusternetes-scheduler:latest
+            [controller-manager]=rusternetes-controller-manager:latest
+            [kube-proxy]=isolated-work-kube-proxy:latest
+          )
+          for src in "${!MAP[@]}"; do
+            docker pull "${GHCR}/${src}:${IMAGE_TAG}"
+            docker tag  "${GHCR}/${src}:${IMAGE_TAG}" "${MAP[$src]}"
+          done
+          docker pull "${GHCR}/kubelet:${IMAGE_TAG}"   # consumed by the node-cdrs build below
+
+      - name: Build the node-cdrs image (containerd-rs + crun + GHCR kubelet)
         working-directory: rusternetes-m1
         run: |
           set -euxo pipefail
-          export DOCKER_BUILDKIT=1
-          # All five service binaries share one cargo-builder stage, so BuildKit
-          # compiles the workspace once and the per-target builds are cheap.
-          # Image tags MUST match compose.cdrs-flannel.yml's `image:` references.
-          svc() { docker build --build-context rhino=./rhino -f Dockerfile.services --target "$1" -t "$2" .; }
-          svc kubelet            crs-cdrs-kubelet:latest            # consumed by deploy/node-cdrs/Dockerfile
-          svc api-server         isolated-work-api-server:latest
-          svc scheduler          rusternetes-scheduler:latest
-          svc controller-manager rusternetes-controller-manager:latest
-          svc kube-proxy         isolated-work-kube-proxy:latest
-          docker build -f Dockerfile.rhino -t rusternetes-rhino:latest rhino
-          docker build -f deploy/node-cdrs/Dockerfile -t rusternetes-node-cdrs:m1 .
+          docker build \
+            --build-arg "KUBELET_IMAGE=${GHCR}/kubelet:${IMAGE_TAG}" \
+            -f deploy/node-cdrs/Dockerfile -t rusternetes-node-cdrs:m1 .
 
       - name: Bring up the M1 stack (gated on real convergence)
         env:

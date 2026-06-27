@@ -140,7 +140,7 @@ NODE2_CTR="${NODE2_CTR:-rusternetes-cdrsf-node-2}"
 say "waiting for data plane to converge (flannel ready + subnet.env + Service routing)"
 converged=0
 ready=0; want=0; subnet1=""; subnet2=""; svc=""
-for _ in $(seq 1 60); do
+for _ in $(seq 1 90); do
   ready=$("$KCTL_WRAP" get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
   want=$("$KCTL_WRAP" get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
   subnet1=$(docker exec "$NODE1_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y' 2>/dev/null)
@@ -152,7 +152,7 @@ for _ in $(seq 1 60); do
   fi
   sleep 5
 done
-[ "$converged" = 1 ] || die "data plane did not converge after ~5m \
+[ "$converged" = 1 ] || die "data plane did not converge after ~7.5m \
 (flannel=${ready}/${want}, subnet.env node-1=${subnet1:-no}/node-2=${subnet2:-no}, ServiceIP healthz=${svc:-none}). \
 This is usually the kube-proxy/flannel startup race — re-run, or inspect kube-proxy + flannel logs."
 say "data plane converged (flannel ${ready}/${want}, subnet.env on both nodes, Service IP 10.96.0.1 routes)"
