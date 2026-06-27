@@ -1,0 +1,177 @@
+# mikronetes harness — a 1 control-plane + 2 worker k0s cluster.
+#
+# MEASURE-ONLY: nodes are NOT memory-capped here. We observe real memory
+# (scripts/mem-sampler.sh) rather than enforce a 512 MB limit; 512 MiB is kept
+# only as a *reference line* in the report (how close to the Pi budget).
+#
+# The k0s config is swappable via ${K0S_CONFIG} so the same harness can run
+# different variants (e.g. default kube-router vs flannel-rs) for comparison.
+#
+#   scripts/cluster-up.sh    bring the cluster up (handles the join token)
+#   scripts/compare-cni.sh   kube-router vs flannel-rs memory comparison
+#   scripts/cluster-down.sh  tear it all down
+name: mikronetes-poc
+
+x-k0s-image: &k0s-image docker.io/k0sproject/k0s:v1.35.5-k0s.0
+
+x-k0s-controller: &k0s-controller
+  image: *k0s-image
+  networks:
+    - k0s-net
+  tmpfs:
+    - /run # this is where k0s stores runtime data
+    - /tmp
+  configs:
+    - source: k0s.yaml
+      target: /etc/k0s/k0s.yaml
+  restart: on-failure
+
+x-k0s-worker: &k0s-worker
+  image: *k0s-image
+  networks:
+    - k0s-net
+  depends_on:
+    - k0s-controller-1
+  command: [k0s, worker, --token-file, /run/secrets/k0sproject.io/tokens/worker]
+  volumes:
+    - /var/lib/k0s # this is where k0s stores its data
+    - /var/log/pods # this is where k0s stores pod logs
+    - /dev/kmsg:/dev/kmsg:ro # required by kubelets OOM watcher
+    - k0s-worker-token:/run/secrets/k0sproject.io/tokens:ro
+  tmpfs:
+    - /run # this is where k0s stores runtime data
+    - /tmp
+  devices:
+    - /dev/kmsg # required by kubelet's OOM watcher
+  cap_add:
+    - sys_admin
+    - net_admin
+    - sys_ptrace
+    - sys_resource
+    - syslog
+  security_opt:
+    - seccomp:unconfined # allow access to the session keyring
+  restart: on-failure
+
+networks:
+  k0s-net:
+    driver: bridge
+
+services:
+  k0s-controller-1:
+    <<: *k0s-controller
+    container_name: k0s-controller-1
+    hostname: k0s-controller-1
+    command: [k0s, controller]
+    post_start:
+      - command:
+          - /bin/sh
+          - -euc
+          - |
+            bootstrap() {
+              # this works even if etcd isn't up
+
+              find /run/secrets/k0sproject.io/controller-token ! -path /run/secrets/k0sproject.io/controller-token -prune -exec rm -rf {} +
+              k0s token pre-shared --role controller \
+                --cert /var/lib/k0s/pki/ca.crt \
+                --url https://k0s-lb:9443 \
+                --out /run/secrets/k0sproject.io/controller-token/
+
+              find /run/secrets/k0sproject.io/worker-token ! -path /run/secrets/k0sproject.io/worker-token -prune -exec rm -rf {} +
+              k0s token pre-shared --role worker \
+                --cert /var/lib/k0s/pki/ca.crt \
+                --url https://k0s-lb:6443 \
+                --out /run/secrets/k0sproject.io/worker-token/
+
+              mv /run/secrets/k0sproject.io/controller-token/*.yaml /var/lib/k0s/manifests/k0s-token-secrets/controller.yaml
+              mv /run/secrets/k0sproject.io/controller-token/token_* /run/secrets/k0sproject.io/controller-token/controller
+              mv /run/secrets/k0sproject.io/worker-token/*.yaml /var/lib/k0s/manifests/k0s-token-secrets/worker.yaml
+              mv /run/secrets/k0sproject.io/worker-token/token_* /run/secrets/k0sproject.io/worker-token/worker
+            }
+
+            while [ ! -f /var/lib/k0s/pki/ca.crt ] || ! bootstrap; do
+              sleep 1
+            done
+            sleep 10 # give this controller a bit of a head start
+
+    volumes:
+      - /var/lib/k0s # this is where k0s stores its data
+      - k0s-token-secrets:/var/lib/k0s/manifests/k0s-token-secrets
+      - k0s-controller-token:/run/secrets/k0sproject.io/controller-token
+      - k0s-worker-token:/run/secrets/k0sproject.io/worker-token
+
+  k0s-controller-2: &k0s-additional-controller
+    <<: *k0s-controller
+    container_name: k0s-controller-2
+    hostname: k0s-controller-2
+    depends_on:
+      - k0s-controller-1
+    command:
+      [
+        k0s,
+        controller,
+        --token-file,
+        /run/secrets/k0sproject.io/tokens/controller,
+      ]
+    volumes:
+      - /var/lib/k0s # this is where k0s stores its data
+      - k0s-token-secrets:/var/lib/k0s/manifests/k0s-token-secrets:ro
+      - k0s-controller-token:/run/secrets/k0sproject.io/tokens:ro
+
+  k0s-controller-3:
+    <<: *k0s-additional-controller
+    container_name: k0s-controller-3
+    hostname: k0s-controller-3
+
+  k0s-worker-1:
+    <<: *k0s-worker
+    container_name: k0s-worker-1
+    hostname: k0s-worker-1
+
+  k0s-worker-2:
+    <<: *k0s-worker
+    container_name: k0s-worker-2
+    hostname: k0s-worker-2
+
+  k0s-worker-3:
+    <<: *k0s-worker
+    container_name: k0s-worker-3
+    hostname: k0s-worker-3
+
+volumes:
+  k0s-token-secrets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  k0s-controller-token:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  k0s-worker-token:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+configs:
+  k0s.yaml:
+    content: |
+      # Baseline k0s config for the mikronetes PoC harness.
+      # This runs REAL k0s in two containers as a known-good starting point we can
+      # iterate on. The mikronetes Rust stack will replace k0s here, component by
+      # component, while this same compose harness + smoke test stays the contract.
+      #
+      # Memory choices (the whole point — fit 512 MB/node):
+      #   - storage.type: kine  -> SQLite, NOT etcd (see docs/k0s-memory-research.md)
+      #   - metrics-server disabled -> saves ~30-60Mi, not needed for the PoC
+      apiVersion: k0s.k0sproject.io/v1beta1
+      kind: ClusterConfig
+      metadata:
+        name: mikronetes-poc
+      spec:
+        storage:
+          type: kine
+          kine:
+            dataSource: "sqlite:///var/lib/k0s/db/state.db?mode=rwc&_journal=WAL"

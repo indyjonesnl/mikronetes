@@ -86,9 +86,23 @@ say "api-server reachable at https://$API_IP:6443"
 # Throwaway kubectl wrapper: rewrite --server to the container IP + inject a
 # dummy token (api-server runs --skip-auth). Bootstrap consumes it via $KUBECTL.
 KCTL_WRAP="$(mktemp)"
+# bootstrap-cluster.sh appends its own `--server https://localhost:6443` when
+# KUBECONFIG=/dev/null (which we set), and that trailing flag would otherwise
+# override ours (last --server wins). So the wrapper strips any incoming
+# --server/--server=… and forces the api-server container IP.
 cat > "$KCTL_WRAP" <<EOF
 #!/usr/bin/env bash
-exec kubectl --server "https://$API_IP:6443" --insecure-skip-tls-verify --token dummy "\$@"
+args=()
+skip=0
+for a in "\$@"; do
+  if [ "\$skip" = 1 ]; then skip=0; continue; fi
+  case "\$a" in
+    --server) skip=1;;
+    --server=*) ;;
+    *) args+=("\$a");;
+  esac
+done
+exec kubectl --server "https://$API_IP:6443" --insecure-skip-tls-verify --token dummy "\${args[@]}"
 EOF
 chmod +x "$KCTL_WRAP"
 trap 'rm -f "$KCTL_WRAP"' EXIT
@@ -110,6 +124,38 @@ KUBECTL="$KCTL_WRAP" KUBECONFIG=/dev/null \
 #    privileged + DirectoryOrCreate fixes).
 say "kubectl apply -f deploy/flannel/flannel-rs.yaml"
 "$KCTL_WRAP" apply -f deploy/flannel/flannel-rs.yaml
+
+# 5. Block until the data plane has ACTUALLY converged, on real conditions —
+#    the bring-up is otherwise race-prone. If kube-proxy loses the startup race
+#    to list Services it never programs the 10.96.0.1 DNAT; flannel-rs
+#    (hostNetwork) then can't reach the api-server, never writes subnet.env, and
+#    every pod fails CNI in a hot-retry loop. Declaring "up" before these hold
+#    produces a flaky cluster (and flaky CI). Gate on:
+#      (a) flannel DS Ready on every node,
+#      (b) /run/flannel/subnet.env present on each node (CNI prerequisite),
+#      (c) the kubernetes Service IP 10.96.0.1:443 routes from a node netns
+#          (proves kube-proxy programmed the Service DNAT — the thing that raced).
+NODE1_CTR="${NODE1_CTR:-rusternetes-cdrsf-node-1}"
+NODE2_CTR="${NODE2_CTR:-rusternetes-cdrsf-node-2}"
+say "waiting for data plane to converge (flannel ready + subnet.env + Service routing)"
+converged=0
+ready=0; want=0; subnet1=""; subnet2=""; svc=""
+for _ in $(seq 1 60); do
+  ready=$("$KCTL_WRAP" get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+  want=$("$KCTL_WRAP" get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+  subnet1=$(docker exec "$NODE1_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y' 2>/dev/null)
+  subnet2=$(docker exec "$NODE2_CTR" sh -c 'test -f /run/flannel/subnet.env && echo y' 2>/dev/null)
+  svc=$(docker exec "$NODE1_CTR" sh -c 'curl -sk --max-time 3 -o /dev/null -w "%{http_code}" https://10.96.0.1:443/healthz 2>/dev/null' 2>/dev/null)
+  if [ "${want:-0}" -ge 2 ] 2>/dev/null && [ "$ready" = "$want" ] \
+     && [ "$subnet1" = y ] && [ "$subnet2" = y ] && [ "$svc" = 200 ]; then
+    converged=1; break
+  fi
+  sleep 5
+done
+[ "$converged" = 1 ] || die "data plane did not converge after ~5m \
+(flannel=${ready}/${want}, subnet.env node-1=${subnet1:-no}/node-2=${subnet2:-no}, ServiceIP healthz=${svc:-none}). \
+This is usually the kube-proxy/flannel startup race — re-run, or inspect kube-proxy + flannel logs."
+say "data plane converged (flannel ${ready}/${want}, subnet.env on both nodes, Service IP 10.96.0.1 routes)"
 
 say "M1 cluster up. Verify + measure with: mikronetes/scripts/m1-smoke.sh"
 say "kubectl: kubectl --server https://$API_IP:6443 --insecure-skip-tls-verify --token dummy get nodes -o wide"
