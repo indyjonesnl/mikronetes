@@ -1,0 +1,121 @@
+name: m1-rust-stack-smoke
+
+# Proves the M1 all-Rust stack works end-to-end on GitHub:
+# a 1 control-plane + 2 worker rusternetes cluster whose data plane is
+# containerd-rs (CRI) + crun (OCI) + flannel-rs (CNI), brought up via the
+# mikronetes M1 harness and gated by m1-smoke (both nodes Ready on the live
+# containerd-rs runtime, a pod served cross-node over flannel-rs, plus a
+# per-component memory breakdown).
+#
+# Build-free: the rusternetes fork is PUBLIC and publishes PUBLIC GHCR images
+# for the control-plane binaries, so this job PULLS them (no Rust compile, no
+# access token). The only image built here is the M1 node image (node-cdrs =
+# containerd-rs + crun + the kubelet binary from the GHCR kubelet image) — a
+# fast COPY-only build, since GHCR has no containerd-rs/crun node variant.
+#
+# The harness (scripts/m1-up.sh + scripts/m1-smoke.sh) lives here; the compose
+# file, deploy/node-cdrs Dockerfile + baked containerd-rs binary, flannel-rs
+# manifest and bootstrap script live in the rusternetes fork, which is checked
+# out alongside and pointed at via RUSTERNETES_M1.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rusternetes_ref:
+        description: 'rusternetes fork ref (compose/manifests/Dockerfiles)'
+        default: 'main'
+        required: false
+      image_tag:
+        description: 'GHCR image tag for the control-plane services'
+        default: 'main'
+        required: false
+
+concurrency:
+  group: m1-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GHCR: ghcr.io/indyjonesnl/rusternetes
+  IMAGE_TAG: ${{ github.event.inputs.image_tag || 'main' }}
+
+jobs:
+  m1-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout mikronetes (the harness)
+        uses: actions/checkout@v4
+
+      - name: Checkout rusternetes fork (compose + Dockerfiles + manifests; PUBLIC, no token)
+        uses: actions/checkout@v4
+        with:
+          repository: indyjonesnl/rusternetes
+          ref: ${{ github.event.inputs.rusternetes_ref || 'main' }}
+          path: rusternetes-m1
+
+      - name: Environment
+        run: |
+          docker version
+          docker compose version
+          echo "cgroup: $(stat -fc %T /sys/fs/cgroup)"
+
+      - name: Install kubectl
+        run: |
+          KV="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Pull GHCR control-plane images + tag to the compose's expected names
+        run: |
+          set -euxo pipefail
+          # Map the published GHCR images onto the local tags that
+          # compose.cdrs-flannel.yml references (it was authored for locally
+          # built images; retagging keeps it unchanged and skips the build).
+          declare -A MAP=(
+            [rhino]=rusternetes-rhino:latest
+            [api-server]=isolated-work-api-server:latest
+            [scheduler]=rusternetes-scheduler:latest
+            [controller-manager]=rusternetes-controller-manager:latest
+            [kube-proxy]=isolated-work-kube-proxy:latest
+          )
+          for src in "${!MAP[@]}"; do
+            docker pull "${GHCR}/${src}:${IMAGE_TAG}"
+            docker tag  "${GHCR}/${src}:${IMAGE_TAG}" "${MAP[$src]}"
+          done
+          docker pull "${GHCR}/kubelet:${IMAGE_TAG}"   # consumed by the node-cdrs build below
+
+      - name: Build the node-cdrs image (containerd-rs + crun + GHCR kubelet)
+        working-directory: rusternetes-m1
+        run: |
+          set -euxo pipefail
+          docker build \
+            --build-arg "KUBELET_IMAGE=${GHCR}/kubelet:${IMAGE_TAG}" \
+            -f deploy/node-cdrs/Dockerfile -t rusternetes-node-cdrs:m1 .
+
+      - name: Bring up the M1 stack (gated on real convergence)
+        env:
+          RUSTERNETES_M1: ${{ github.workspace }}/rusternetes-m1
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/rusternetes-m1/.rusternetes/volumes
+        run: bash scripts/m1-up.sh
+
+      - name: Smoke gate (nodes Ready on containerd-rs + cross-node flannel + memory)
+        env:
+          RUSTERNETES_M1: ${{ github.workspace }}/rusternetes-m1
+        run: bash scripts/m1-smoke.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a || true
+          for c in rusternetes-cdrsf-rhino rusternetes-cdrsf-api-server \
+                   rusternetes-cdrsf-scheduler rusternetes-cdrsf-controller-manager \
+                   rusternetes-cdrsf-kube-proxy-1 rusternetes-cdrsf-kube-proxy-2 \
+                   rusternetes-cdrsf-node-1 rusternetes-cdrsf-node-2; do
+            echo "::group::logs $c"
+            docker logs --tail=200 "$c" 2>&1 || true
+            echo "::endgroup::"
+          done
