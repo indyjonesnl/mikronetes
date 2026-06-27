@@ -1,0 +1,115 @@
+name: m1-rust-stack-smoke
+
+# Proves the M1 all-Rust stack works end-to-end on GitHub:
+# a 1 control-plane + 2 worker rusternetes cluster whose data plane is
+# containerd-rs (CRI) + crun (OCI) + flannel-rs (CNI), brought up via the
+# mikronetes M1 harness and gated by m1-smoke (both nodes Ready on the live
+# containerd-rs runtime, a pod served cross-node over flannel-rs, plus a
+# per-component memory breakdown).
+#
+# The stack spans two repos: this one (mikronetes) holds the harness
+# (scripts/m1-up.sh + scripts/m1-smoke.sh); the rusternetes fork holds the
+# compose file, Dockerfiles, deploy/node-cdrs (with the baked containerd-rs
+# binary) and the rhino submodule. So the job checks rusternetes out alongside
+# and points the harness at it via RUSTERNETES_M1.
+#
+# REQUIRED SETUP (one-time):
+#   - Repo secret `RUSTERNETES_TOKEN`: a PAT/fine-grained token with read access
+#     to indyjonesnl/rusternetes AND its `rhino` submodule (indyjonesnl/rhino).
+#     Used only to check those repos out.
+#
+# Heavy job (full Rust workspace compile + 3-node compose), so it does NOT run
+# on every PR — only on pushes to main, a weekly schedule, and manual dispatch.
+# Override the rusternetes ref via the workflow_dispatch input.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/m1-up.sh'
+      - 'scripts/m1-smoke.sh'
+      - 'scripts/mem-breakdown.*'
+      - '.github/workflows/m1-stack.yml'
+  schedule:
+    - cron: '0 6 * * 1'          # Mondays 06:00 UTC — catch drift in the fork
+  workflow_dispatch:
+    inputs:
+      rusternetes_ref:
+        description: 'rusternetes fork ref to test'
+        default: 'main'
+        required: false
+
+concurrency:
+  group: m1-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  m1-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout mikronetes (the harness)
+        uses: actions/checkout@v4
+
+      - name: Checkout rusternetes fork (compose + Dockerfiles + rhino submodule)
+        uses: actions/checkout@v4
+        with:
+          repository: indyjonesnl/rusternetes
+          ref: ${{ github.event.inputs.rusternetes_ref || 'main' }}
+          path: rusternetes-m1
+          submodules: recursive
+          token: ${{ secrets.RUSTERNETES_TOKEN }}
+
+      - name: Environment
+        run: |
+          docker version
+          docker compose version
+          echo "cgroup: $(stat -fc %T /sys/fs/cgroup)"
+
+      - name: Install kubectl
+        run: |
+          KV="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Build the Rust-stack images
+        working-directory: rusternetes-m1
+        run: |
+          set -euxo pipefail
+          export DOCKER_BUILDKIT=1
+          # All five service binaries share one cargo-builder stage, so BuildKit
+          # compiles the workspace once and the per-target builds are cheap.
+          # Image tags MUST match compose.cdrs-flannel.yml's `image:` references.
+          svc() { docker build --build-context rhino=./rhino -f Dockerfile.services --target "$1" -t "$2" .; }
+          svc kubelet            crs-cdrs-kubelet:latest            # consumed by deploy/node-cdrs/Dockerfile
+          svc api-server         isolated-work-api-server:latest
+          svc scheduler          rusternetes-scheduler:latest
+          svc controller-manager rusternetes-controller-manager:latest
+          svc kube-proxy         isolated-work-kube-proxy:latest
+          docker build -f Dockerfile.rhino -t rusternetes-rhino:latest rhino
+          docker build -f deploy/node-cdrs/Dockerfile -t rusternetes-node-cdrs:m1 .
+
+      - name: Bring up the M1 stack (gated on real convergence)
+        env:
+          RUSTERNETES_M1: ${{ github.workspace }}/rusternetes-m1
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/rusternetes-m1/.rusternetes/volumes
+        run: bash scripts/m1-up.sh
+
+      - name: Smoke gate (nodes Ready on containerd-rs + cross-node flannel + memory)
+        env:
+          RUSTERNETES_M1: ${{ github.workspace }}/rusternetes-m1
+        run: bash scripts/m1-smoke.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          docker ps -a || true
+          for c in rusternetes-cdrsf-rhino rusternetes-cdrsf-api-server \
+                   rusternetes-cdrsf-scheduler rusternetes-cdrsf-controller-manager \
+                   rusternetes-cdrsf-kube-proxy-1 rusternetes-cdrsf-kube-proxy-2 \
+                   rusternetes-cdrsf-node-1 rusternetes-cdrsf-node-2; do
+            echo "::group::logs $c"
+            docker logs --tail=200 "$c" 2>&1 || true
+            echo "::endgroup::"
+          done

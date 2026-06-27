@@ -77,6 +77,23 @@ for ctr in "$NODE1" "$NODE2"; do
 done
 
 echo "=== 3. Cross-node pod-to-pod curl over flannel-rs ==="
+# Provision the cross-node test fixtures if absent — the gate sets up its own
+# pods (one whoami per node) rather than requiring a manual pre-deploy, so it
+# runs unattended in CI. No-op when they already exist.
+running=$(kc get pods -n default -l m1smoke=whoami --no-headers 2>/dev/null | grep -c ' Running ' || true)
+if [ "${running:-0}" -lt 2 ]; then
+  echo "  deploying whoami test pods (one per node)"
+  kc run whoami-n1 --image=traefik/whoami:v1.10.2 --labels=m1smoke=whoami \
+    --overrides='{"spec":{"nodeName":"'"$N1"'"}}' >/dev/null 2>&1 || true
+  kc run whoami-n2 --image=traefik/whoami:v1.10.2 --labels=m1smoke=whoami \
+    --overrides='{"spec":{"nodeName":"'"$N2"'"}}' >/dev/null 2>&1 || true
+  for _ in $(seq 1 36); do
+    r=$(kc get pods -n default -l m1smoke=whoami \
+        -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -c Running || true)
+    [ "${r:-0}" -ge 2 ] && break
+    sleep 5
+  done
+fi
 # Find the two whoami test pods (one per node) and their flannel pod IPs.
 read -r P1 IP1 PN1 <<EOF
 $(kc get pods -n default -l m1smoke=whoami -o jsonpath='{range .items[?(@.spec.nodeName=="'"$N1"'")]}{.metadata.name} {.status.podIP} {.spec.nodeName}{"\n"}{end}' 2>/dev/null | head -1)
