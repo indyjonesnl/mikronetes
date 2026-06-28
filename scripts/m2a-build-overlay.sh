@@ -23,7 +23,7 @@ RUSTERNETES_PARENT="$(dirname "$RUSTERNETES_SRC")"
 
 OUT="${OUT:-$REPO_ROOT/out/overlay}"
 rm -rf "$OUT"
-mkdir -p "$OUT/bin" "$OUT/cni/bin" "$OUT/cni/conf" "$OUT/pki"
+mkdir -p "$OUT/bin" "$OUT/cni/bin" "$OUT/cni/conf" "$OUT/pki/k8s"
 
 # ---------------------------------------------------------------------------
 # rusternetes all-in-one — musl-static binary from Dockerfile.all-in-one.
@@ -104,10 +104,65 @@ install -m0755 "$tmp/flannel-amd64" "$OUT/cni/bin/flannel"
 # ---------------------------------------------------------------------------
 cat > "$OUT/cni/conf/10-bootstrap-bridge.conflist" <<'JSON'
 { "cniVersion": "0.3.1", "name": "bootstrap", "plugins": [
-  { "type": "bridge", "bridge": "cni0", "isGateway": true, "ipMasq": true,
+  { "type": "bridge", "bridge": "cni0", "isGateway": true, "ipMasq": false,
     "ipam": { "type": "host-local", "subnet": "10.244.0.0/24",
               "routes": [ { "dst": "0.0.0.0/0" } ] } } ] }
 JSON
+
+# ---------------------------------------------------------------------------
+# Kubernetes PKI for rusternetes: CA + server cert/key baked onto
+# /boot/pki/k8s/ (subdirectory avoids collision with machined's own node PKI
+# files — ca.pem, ca.key, server.pem, server.key — placed at /boot/pki/ by
+# machined-imager's --pki-dir step which runs AFTER the overlay).
+#
+# rusternetes reads --tls-cert-file /boot/pki/k8s/server.crt and
+# --tls-key-file /boot/pki/k8s/server.key (set in config.yaml).
+# resolve_ca_cert_pem() finds /boot/pki/k8s/ca.crt as a sibling of the cert
+# file and embeds it in every SA token secret instead of falling back to the
+# leaf serving cert — this is required so in-cluster clients (flannel-rs) can
+# verify the API server's TLS cert.
+#
+# SANs: localhost + 127.0.0.1 (flannel hostNetwork loopback), 10.88.0.2 (VM
+# NIC), 10.96.0.1 (kubernetes Service ClusterIP), kubernetes DNS aliases.
+# ---------------------------------------------------------------------------
+PKI="$OUT/pki/k8s"
+if [[ -f "$PKI/ca.crt" && -f "$PKI/server.crt" && -f "$PKI/server.key" ]]; then
+    echo "==> overlay PKI already present — skipping cert generation"
+else
+    echo "==> generating overlay PKI (CA + server cert)"
+    openssl genrsa -out "$PKI/ca.key" 2048 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "$PKI/ca.key" -out "$PKI/ca.crt" \
+        -subj "/CN=rusternetes-ca/O=mikronetes" 2>/dev/null
+    openssl genrsa -out "$PKI/server.key" 2048 2>/dev/null
+    openssl req -new -key "$PKI/server.key" -out "$PKI/server.csr" \
+        -subj "/CN=rusternetes-api/O=mikronetes" 2>/dev/null
+    cat > "$PKI/server.ext" <<'EXT'
+[v3_req]
+subjectAltName = @alt_names
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+[alt_names]
+DNS.1 = localhost
+DNS.2 = kubernetes
+DNS.3 = kubernetes.default
+DNS.4 = kubernetes.default.svc
+DNS.5 = kubernetes.default.svc.cluster.local
+DNS.6 = node-1
+IP.1 = 127.0.0.1
+IP.2 = 10.88.0.2
+IP.3 = 10.96.0.1
+EXT
+    openssl x509 -req -days 3650 -in "$PKI/server.csr" \
+        -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" -CAcreateserial \
+        -out "$PKI/server.crt" -extensions v3_req -extfile "$PKI/server.ext" 2>/dev/null
+    # Append CA to server cert for a full chain (rusternetes TlsConfig::from_pem_files
+    # parses all PEM blocks; sending the full chain is good practice).
+    cat "$PKI/ca.crt" >> "$PKI/server.crt"
+    rm -f "$PKI/ca.key" "$PKI/server.csr" "$PKI/server.ext" "$PKI/ca.srl"
+    chmod 600 "$PKI/server.key"
+    echo "    CA:     $(openssl x509 -noout -subject -in "$PKI/ca.crt")"
+    echo "    server: $(openssl x509 -noout -subject -issuer -in <(openssl x509 -in "$PKI/server.crt"))"
+fi
 
 # ---------------------------------------------------------------------------
 # Machine config + containerd-rs config (from deploy/m2a).
