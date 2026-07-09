@@ -67,10 +67,10 @@ machine:
         - --node-name
         - node-1
         - --skip-auth
-        - --disable-proxy
-        - --disable-dns
         - --volume-dir
         - /var/lib/rusternetes/volumes
+        - --cluster-cidr
+        - 10.244.0.0/16
       depends_on: [containerd]
       restart: always
       env:
@@ -149,6 +149,20 @@ YAML
         - { key: RUST_LOG, value: info }
         - { key: PATH, value: "/boot/bin:/usr/bin:/bin" }
         - { key: CONTAINER_RUNTIME_ENDPOINT, value: "unix:///run/containerd-rs.sock" }
+    - id: kube-proxy
+      command:
+        - /boot/bin/kube-proxy
+        - --node-name
+        - ${node}
+        - --kubeconfig
+        - /boot/kubelet.kubeconfig
+        - --api-server-url
+        - https://10.88.0.2:6443
+        - --insecure-skip-tls-verify
+        - "true"
+        - --cluster-cidr
+        - 10.244.0.0/16
+      restart: on_failure
 YAML
 }
 
