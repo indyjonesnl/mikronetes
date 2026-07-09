@@ -32,7 +32,10 @@ nohup setsid "$CH_BIN" \
   --net "tap=mkn0,mac=52:55:00:88:00:02" \
   --serial tty --console off --api-socket "$node_dir/ch.sock" \
   >> "$serial" 2>&1 &
-echo "$!" > "$node_dir/ch.pid"
+newpid="$!"
+echo "$newpid" > "$node_dir/ch.pid"
+sleep 1
+kill -0 "$newpid" >/dev/null 2>&1 || { tail -30 "$serial" >&2; echo "ERROR: node-1 CH exited during relaunch" >&2; exit 1; }
 
 say "waiting for node-1 API to return"
 kc() { kubectl --server "https://10.88.0.2:6443" --insecure-skip-tls-verify --token dummy "$@"; }
