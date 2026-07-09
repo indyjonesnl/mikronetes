@@ -56,7 +56,7 @@ machine:
         - --storage-backend
         - sqlite
         - --data-dir
-        - /var/lib/rusternetes/db
+        - /system/state/rusternetes/state.db
         - --tls
         - --tls-cert-file
         - /boot/pki/k8s/server.crt
