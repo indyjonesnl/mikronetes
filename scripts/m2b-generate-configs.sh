@@ -159,7 +159,6 @@ YAML
         - --api-server-url
         - https://10.88.0.2:6443
         - --insecure-skip-tls-verify
-        - "true"
         - --cluster-cidr
         - 10.244.0.0/16
       restart: on_failure
