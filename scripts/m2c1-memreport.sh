@@ -54,7 +54,7 @@ data:
           [ -n "$name" ] || continue
           [ -n "$rss" ] || rss=0
           case "$name" in
-            machined|containerd-rs|rusternetes|kubelet|kube-proxy|flanneld|rusternetes-dns|whoami|apache2|php-fpm|httpd|crun|runc|pause)
+            machined|containerd-rs|rusternetes|kubelet|kube-proxy|flanneld|rusternetes-dns|whoami|apache2|php-fpm|php84|httpd|crun|runc|pause)
               printf "%s %s\n" "$name" "$rss"
               ;;
           esac
