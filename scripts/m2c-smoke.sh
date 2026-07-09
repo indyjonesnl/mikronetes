@@ -33,12 +33,20 @@ for node in node-1 node-2 node-3 node-4; do
 done
 
 echo "=== 2. kube-proxy programmed NAT rules on each node (serial evidence) ==="
+# kube-proxy only logs "built N bytes of NAT rules" once Services exist, so this
+# can lag bootstrap by a sync interval — poll rather than grep once.
 for node in node-1 node-2 node-3 node-4; do
-  if sed 's/\x1b\[[0-9;]*m//g' "out/m2b/$node/serial.log" 2>/dev/null | grep -qaE 'built [0-9]+ bytes of NAT rules'; then
-    pass "$node kube-proxy applied NAT rules"
-  else
-    bad "$node kube-proxy did not report applying NAT rules"
-  fi
+  ok=0
+  for _ in $(seq 1 20); do
+    # grep the file directly (no `sed |` pipe): under `set -o pipefail`, grep -q
+    # closing the pipe early SIGPIPEs sed and the pipeline reports failure even
+    # on a match. The target text carries no ANSI codes, so raw grep is fine.
+    if grep -qaE 'built [0-9]+ bytes of NAT rules' "out/m2b/$node/serial.log" 2>/dev/null; then
+      ok=1; break
+    fi
+    sleep 2
+  done
+  [ "$ok" = 1 ] && pass "$node kube-proxy applied NAT rules" || bad "$node kube-proxy did not report applying NAT rules"
 done
 
 echo "=== 3. system Services own their pinned ClusterIPs; whoami is separate ==="
