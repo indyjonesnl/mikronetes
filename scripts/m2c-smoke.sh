@@ -9,7 +9,6 @@ kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token 
 
 echo "=== 1. worker kube-proxy services running ==="
 for node in node-2 node-3 node-4; do
-  ip=$(case $node in node-2) echo 10.88.0.3;; node-3) echo 10.88.0.4;; node-4) echo 10.88.0.5;; esac)
   if grep -qaE 'kube-proxy|RUSTERNETES-SERVICES|Applied .*rules' "out/m2b/$node/serial.log" 2>/dev/null; then
     pass "$node kube-proxy active in serial log"
   else
