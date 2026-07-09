@@ -5,17 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VMIP="${VMIP:-10.88.0.2}"
 REGISTRY_HOST_PORT="${REGISTRY_HOST_PORT:-5000}"
-PHP_IMAGE_SOURCE="${PHP_IMAGE_SOURCE:-php:8.4-apache}"
+PHP_IMAGE_TAG="${PHP_IMAGE_TAG:-mikronetes-php:m2c}"
 say() { printf '\n==> %s\n' "$*"; }
 kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token dummy "$@"; }
 
 # M2c-0: system Services (kubernetes @.1, kube-dns @.10) + rusternetes-dns + whoami.
 bash "$SCRIPT_DIR/m2c-bootstrap.sh"
 
-say "mirroring $PHP_IMAGE_SOURCE into the local registry"
-docker image inspect "$PHP_IMAGE_SOURCE" >/dev/null 2>&1 || docker pull "$PHP_IMAGE_SOURCE"
-docker tag "$PHP_IMAGE_SOURCE" "localhost:${REGISTRY_HOST_PORT}/php:8.4-apache"
-docker push "localhost:${REGISTRY_HOST_PORT}/php:8.4-apache" >/dev/null
+# Minimal alpine PHP image (build if missing) mirrored into the local registry.
+# Custom + tiny on purpose: the official php images (Debian ~500MB / cli-alpine)
+# either trip containerd-rs's unpacker or fill the worker's small disk (ENOSPC).
+say "ensuring $PHP_IMAGE_TAG in the local registry"
+if ! docker image inspect "$PHP_IMAGE_TAG" >/dev/null 2>&1; then
+  docker build -f "$REPO_ROOT/deploy/m2c/php-alpine.Dockerfile" -t "$PHP_IMAGE_TAG" "$REPO_ROOT"
+fi
+docker tag "$PHP_IMAGE_TAG" "localhost:${REGISTRY_HOST_PORT}/mikronetes-php:m2c"
+docker push "localhost:${REGISTRY_HOST_PORT}/mikronetes-php:m2c" >/dev/null
 
 say "applying PHP DaemonSet + web Service"
 kc apply -f "$REPO_ROOT/deploy/m2c/php-daemonset.yaml"

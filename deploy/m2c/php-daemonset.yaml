@@ -27,7 +27,14 @@ spec:
       # landing exactly one pod on each of the three workers.
       containers:
       - name: php
-        image: 10.88.0.1:5000/php:8.4-apache
+        # Minimal custom image (deploy/m2c/php-alpine.Dockerfile: alpine:3.21 +
+        # apk php84, ~18MB). The official php:8.4-apache (~500MB Debian) and
+        # php:8.4-cli-alpine both broke here: the big Debian pull filled the
+        # worker's small disk and every subsequent containerd-rs layer unpack
+        # failed with ENOSPC. This tiny image (image ENTRYPOINT runs
+        # `php84 -S 0.0.0.0:80 -t /var/www/html`) keeps the workers well under
+        # their disk budget.
+        image: 10.88.0.1:5000/mikronetes-php:m2c
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 80
