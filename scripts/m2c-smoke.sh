@@ -85,7 +85,11 @@ spec:
     - sh
     - -c
     - |
-      nslookup whoami.default.svc.cluster.local 2>&1 | grep -q '10.96' || exit 11
+      # Match the ANSWER (the Address after the "Name:" line), not busybox's own
+      # "Server/Address: 10.96.0.10:53" resolver lines which print regardless.
+      addr=$(nslookup whoami.default.svc.cluster.local 2>/dev/null | awk 'x && $1=="Address:"{print $2; exit} /^Name:/{x=1}')
+      echo "resolved=$addr"
+      case "$addr" in 10.96.*) ;; *) exit 11;; esac
       c=$(for i in $(seq 1 20); do wget -qO- --timeout=5 http://whoami.default.svc.cluster.local:80 | grep Hostname; done | sort -u | wc -l)
       echo "backends=$c"
       [ "$c" -ge 2 ] || exit 12
