@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: php-index
+  namespace: default
+data:
+  index.php: |
+    <?php
+    header('Content-Type: text/plain');
+    echo "Hostname: " . gethostname() . "\n";
+    echo "PodIP: " . ($_SERVER['SERVER_ADDR'] ?? 'unknown') . "\n";
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: php-web
+  namespace: default
+  labels: { app: php-web }
+spec:
+  selector:
+    matchLabels: { app: php-web }
+  template:
+    metadata:
+      labels: { app: php-web }
+    spec:
+      # No control-plane toleration => the DaemonSet skips tainted node-1,
+      # landing exactly one pod on each of the three workers.
+      containers:
+      - name: php
+        image: 10.88.0.1:5000/php:8.4-apache
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: index
+          mountPath: /var/www/html
+      volumes:
+      - name: index
+        configMap:
+          name: php-index
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: default
+spec:
+  type: ClusterIP
+  selector: { app: php-web }
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
