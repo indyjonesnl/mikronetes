@@ -66,6 +66,13 @@ else
     "$IMAGER" gen-pki --out "$PKI_DIR"
 fi
 
+# M2 overlays provide containerd-rs, crun, and CNI plugins on /boot.
+# The upstream machined artifact manifest also carries containerd/runc/CNI for
+# generic images; filter those out so this build only fetches what it uses.
+MICROVM_MANIFEST="$OUT/artifacts-microvm.toml"
+sed '/{ name = "\(containerd\|runc\|cni-plugins\)"/d' \
+    "$MR/crates/imager/artifacts.toml" > "$MICROVM_MANIFEST"
+
 # ---------------------------------------------------------------------------
 # 4. Build the image.  --overlay bakes the Rust stack onto FAT /boot;
 #    --emit-boot copies vmlinuz + initramfs.img for QEMU direct-kernel boot.
@@ -80,7 +87,7 @@ echo "==> building image (this fetches the kernel via the artifact cache)"
     --pki-dir "$PKI_DIR" \
     --emit-boot "$OUT/boot" \
     --out "$OUT/m2a.img" \
-    --manifest "$MR/crates/imager/artifacts.toml" \
+    --manifest "$MICROVM_MANIFEST" \
     --cache "$OUT/imager-cache"
 
 echo ""

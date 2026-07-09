@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.6
 # Musl-static all-in-one rusternetes binary for the M2a microVM overlay.
 #
-# Wraps rusternetes/Dockerfile.all-in-one with two fixes applied:
+# Wraps rusternetes/all-in-one.Dockerfile with two fixes applied:
 #   1. Uses rust:1.95-alpine (musl toolchain by default) so the output binary
 #      is statically linked against musl — required for the Alpine initramfs.
 #   2. Adds `test_support` to the CRATE-ENUMERATION (2/3) dummy stub block,
@@ -9,7 +9,7 @@
 #      specified" at cargo build time.
 #
 # Build context is the PARENT directory of rusternetes/ (same as upstream):
-#   docker build -f mikronetes/deploy/m2a/Dockerfile.all-in-one-musl \
+#   docker build -f mikronetes/deploy/m2a/all-in-one-musl.Dockerfile \
 #                -t mikronetes-aio:m2a /home/jones/PhpstormProjects
 #
 # aws-lc-rs requires cmake + C compiler; alpine provides them via build-base
@@ -82,7 +82,6 @@ COPY rusternetes/crates/kubectl/Cargo.toml            ./rusternetes/crates/kubec
 COPY rusternetes/crates/kubelet/Cargo.toml            ./rusternetes/crates/kubelet/Cargo.toml
 COPY rusternetes/crates/kube-proxy/Cargo.toml         ./rusternetes/crates/kube-proxy/Cargo.toml
 COPY rusternetes/crates/middleware/Cargo.toml         ./rusternetes/crates/middleware/Cargo.toml
-COPY rusternetes/crates/netstack/Cargo.toml           ./rusternetes/crates/netstack/Cargo.toml
 COPY rusternetes/crates/protobuf/Cargo.toml           ./rusternetes/crates/protobuf/Cargo.toml
 COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/rusternetes/Cargo.toml
 COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
@@ -101,7 +100,7 @@ COPY rusternetes/crates/cri/proto           ./rusternetes/crates/cri/proto
 # caused "no targets specified in the manifest" at cargo build time).
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common storage cloud-providers netstack protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
+    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -142,7 +141,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-kubelet \
         -p rusternetes-kube-proxy \
         -p rusternetes-middleware \
-        -p rusternetes-netstack \
         -p rusternetes-protobuf \
         -p rusternetes \
         -p rusternetes-scheduler \
@@ -172,7 +170,6 @@ COPY rusternetes/crates/kubelet/tests            ./crates/kubelet/tests
 COPY rusternetes/crates/kube-proxy/src           ./crates/kube-proxy/src
 COPY rusternetes/crates/kube-proxy/tests         ./crates/kube-proxy/tests
 COPY rusternetes/crates/middleware/src           ./crates/middleware/src
-COPY rusternetes/crates/netstack/src             ./crates/netstack/src
 COPY rusternetes/crates/protobuf/src             ./crates/protobuf/src
 COPY rusternetes/crates/rusternetes/src          ./crates/rusternetes/src
 COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src

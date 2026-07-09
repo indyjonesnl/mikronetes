@@ -6,6 +6,7 @@
 #   mkn-br0  10.88.0.1/24  (bridge / host gateway)
 #   mkn0     tap, owned by $USER, enslaved to mkn-br0
 #   VM eth0  10.88.0.2/24  (static, set in /boot/config.yaml)
+#   pods     10.244.0.0/24 routed via VM eth0 once flannel-rs is up
 set -euo pipefail
 
 BR=mkn-br0
@@ -20,4 +21,5 @@ sudo /usr/sbin/ip link set "$TAP" master "$BR"
 sudo /usr/sbin/ip link set "$BR" up
 sudo /usr/sbin/ip link set "$TAP" up
 sudo /usr/sbin/sysctl -wq net.ipv4.ip_forward=1
+sudo /usr/sbin/ip route replace 10.244.0.0/24 via 10.88.0.2 dev "$BR"
 echo "bridge $BR + tap $TAP up (gw 10.88.0.1, VM 10.88.0.2)"

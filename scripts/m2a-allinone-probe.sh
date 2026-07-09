@@ -13,7 +13,7 @@
 #   CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock is sufficient.
 #
 # Note on the all-in-one image: there is NO GHCR all-in-one image. The binary
-# is built from Dockerfile.all-in-one (plan task C2 automates this). The probe
+# is built from all-in-one.Dockerfile (plan task C2 automates this). The probe
 # image rusternetes-aio-probe:cri is a minimal Debian wrapper around the binary
 # compiled from crates/rusternetes/ at HEAD.
 #
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 M1="${RUSTERNETES_M1:-/home/jones/PhpstormProjects/rusternetes-m1}"
-# CRI-capable all-in-one image built from HEAD source (Dockerfile.all-in-one).
+# CRI-capable all-in-one image built from HEAD source (all-in-one.Dockerfile).
 # rusternetes-rusternetes:latest was built before the CRI-only kubelet migration
 # and still has Bollard; rusternetes-aio-probe:cri is built from current HEAD.
 AIO_IMAGE="${AIO_IMAGE:-rusternetes-aio-probe:cri}"
@@ -43,7 +43,7 @@ die(){ printf '\nFAIL: %s\n' "$*" >&2
 #      cd /home/jones/PhpstormProjects/rusternetes
 #      cargo build -p rusternetes
 #      cp target/debug/rusternetes /tmp/probe-build/rusternetes
-#      docker build -f /tmp/probe-build/Dockerfile.aio-probe -t rusternetes-aio-probe:cri /tmp/probe-build/
+#      docker build -f /tmp/probe-build/aio-probe.Dockerfile -t rusternetes-aio-probe:cri /tmp/probe-build/
 say "checking all-in-one image: ${AIO_IMAGE}"
 docker image inspect "${AIO_IMAGE}" >/dev/null 2>&1 \
   || die "all-in-one image '${AIO_IMAGE}' not found — see comment above for build steps"

@@ -6,45 +6,143 @@
 # Usage: bash scripts/m2a-build-overlay.sh
 #
 # Env overrides:
-#   RUSTERNETES_M1  — path to the rusternetes-m1 worktree (default: /home/jones/PhpstormProjects/rusternetes-m1)
 #   RUSTERNETES_SRC — path to the canonical rusternetes checkout (default: /home/jones/PhpstormProjects/rusternetes)
 #   OUT             — output overlay dir (default: <repo-root>/out/overlay)
 #   IMAGE_TAG       — unused (no GHCR all-in-one image exists); kept for compat
+#   CONFIG_PATH     — machine config copied to /boot/config.yaml
+#   KUBECONFIG_PATH — optional kubelet kubeconfig copied to /boot/kubelet.kubeconfig
+#   REQUIRE_KUBELET — when 1, copy/build standalone kubelet for worker overlays
+#   REBUILD_AIO     — when 1, rebuild mikronetes-aio:m2a even if the image tag exists
+#   REBUILD_KUBELET — when 1, rebuild mikronetes-kubelet:m2b even if the image tag exists
+#   CONTAINERD_RS_VERSION — GitHub release tag to install (default: v0.2.0)
+#   CONTAINERD_RS_ARCH    — release arch override: amd64 or arm64 (default: host arch)
+#   CONTAINERD_RS_BIN     — local containerd-rs binary override, skips release download
+#   CONTAINERD_RS_CACHE   — release artifact cache dir (default: <repo-root>/out/cache/containerd-rs)
+#   CONTAINERD_RS_INSECURE_REGISTRIES — optional legacy comma-separated HTTP registry fallback for old containerd-rs builds
+#   CA_CERT_BUNDLE        — CA bundle copied for containerd-rs TLS client initialization
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-M1="${RUSTERNETES_M1:-/home/jones/PhpstormProjects/rusternetes-m1}"
-# Canonical rusternetes checkout (NOT rusternetes-m1). Dockerfile.all-in-one
+# Canonical rusternetes checkout (NOT rusternetes-m1). all-in-one.Dockerfile
 # requires the PARENT dir as build context so rusternetes/rhino is accessible.
 RUSTERNETES_SRC="${RUSTERNETES_SRC:-/home/jones/PhpstormProjects/rusternetes}"
 RUSTERNETES_PARENT="$(dirname "$RUSTERNETES_SRC")"
 
 OUT="${OUT:-$REPO_ROOT/out/overlay}"
+CONFIG_PATH="${CONFIG_PATH:-$REPO_ROOT/deploy/m2a/config.yaml}"
+KUBECONFIG_PATH="${KUBECONFIG_PATH:-}"
+REQUIRE_KUBELET="${REQUIRE_KUBELET:-0}"
+REBUILD_AIO="${REBUILD_AIO:-0}"
+REBUILD_KUBELET="${REBUILD_KUBELET:-0}"
+CONTAINERD_RS_VERSION="${CONTAINERD_RS_VERSION:-v0.2.0}"
+CONTAINERD_RS_ARCH="${CONTAINERD_RS_ARCH:-}"
+CONTAINERD_RS_BIN="${CONTAINERD_RS_BIN:-}"
+CONTAINERD_RS_CACHE="${CONTAINERD_RS_CACHE:-$REPO_ROOT/out/cache/containerd-rs}"
+CONTAINERD_RS_INSECURE_REGISTRIES="${CONTAINERD_RS_INSECURE_REGISTRIES:-}"
+CA_CERT_BUNDLE="${CA_CERT_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
 rm -rf "$OUT"
-mkdir -p "$OUT/bin" "$OUT/cni/bin" "$OUT/cni/conf" "$OUT/pki/k8s"
+mkdir -p "$OUT/bin" "$OUT/certs.d" "$OUT/cni/bin" "$OUT/cni/conf" "$OUT/pki/k8s" "$OUT/ssl/certs"
+
+containerd_rs_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "amd64" ;;
+        aarch64 | arm64) echo "arm64" ;;
+        *)
+            echo "unsupported containerd-rs host arch: $(uname -m)" >&2
+            echo "set CONTAINERD_RS_ARCH=amd64 or CONTAINERD_RS_ARCH=arm64" >&2
+            exit 1
+            ;;
+    esac
+}
+
+install_containerd_rs() {
+    if [ -n "$CONTAINERD_RS_BIN" ]; then
+        echo "==> copying containerd-rs from $CONTAINERD_RS_BIN"
+        install -m0755 "$CONTAINERD_RS_BIN" "$OUT/bin/containerd-rs"
+        return
+    fi
+
+    local arch="${CONTAINERD_RS_ARCH:-$(containerd_rs_arch)}"
+    local artifact="containerd-rs_${CONTAINERD_RS_VERSION}_linux_${arch}.tar.gz"
+    local checksums="containerd-rs_${CONTAINERD_RS_VERSION}_checksums.txt"
+    local base_url="https://github.com/indyjonesnl/containerd-rs/releases/download/${CONTAINERD_RS_VERSION}"
+    local cache_dir="$CONTAINERD_RS_CACHE/$CONTAINERD_RS_VERSION/$arch"
+    local extract_dir
+
+    mkdir -p "$cache_dir"
+    if [ ! -f "$cache_dir/$artifact" ]; then
+        echo "==> downloading containerd-rs $CONTAINERD_RS_VERSION ($arch)"
+        curl -fsSL -o "$cache_dir/$artifact" "$base_url/$artifact"
+    else
+        echo "==> using cached containerd-rs $CONTAINERD_RS_VERSION ($arch)"
+    fi
+
+    if [ ! -f "$cache_dir/$checksums" ]; then
+        curl -fsSL -o "$cache_dir/$checksums" "$base_url/$checksums"
+    fi
+
+    (cd "$cache_dir" && grep -E "[[:space:]]${artifact}$" "$checksums" | sha256sum -c -)
+    extract_dir="$(mktemp -d)"
+    tar -xzf "$cache_dir/$artifact" -C "$extract_dir"
+    install -m0755 "$extract_dir/containerd-rs" "$OUT/bin/containerd-rs"
+    rm -rf "$extract_dir"
+}
+
+install_containerd_rs_wrapper() {
+    local cc="${CC:-musl-gcc}"
+    local src="$OUT/containerd-rs-mikronetes.c"
+
+    if ! command -v "$cc" >/dev/null 2>&1; then
+        echo "ERROR: $cc not found; install musl-tools or set CC to a static-capable compiler" >&2
+        exit 1
+    fi
+
+    echo "==> building static containerd-rs env wrapper"
+    cat > "$src" <<C
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    (void)argc;
+    if ("${CONTAINERD_RS_INSECURE_REGISTRIES}"[0] != '\\0') {
+        setenv("CONTAINERD_RS_INSECURE_REGISTRIES", "${CONTAINERD_RS_INSECURE_REGISTRIES}", 1);
+    }
+    setenv("SSL_CERT_FILE", "/boot/ssl/certs/ca-certificates.crt", 1);
+    setenv("SSL_CERT_DIR", "/boot/ssl/certs", 1);
+    argv[0] = "/boot/bin/containerd-rs";
+    execv("/boot/bin/containerd-rs", argv);
+    fprintf(stderr, "containerd-rs-mikronetes: execv failed: %d\\n", errno);
+    return 127;
+}
+C
+    "$cc" -static -Os -s -o "$OUT/bin/containerd-rs-mikronetes" "$src"
+    rm -f "$src"
+}
 
 # ---------------------------------------------------------------------------
-# rusternetes all-in-one — musl-static binary from Dockerfile.all-in-one.
+# rusternetes all-in-one — musl-static binary from all-in-one.Dockerfile.
 #
 # There is NO GHCR all-in-one image; /app/rusternetes is produced ONLY by
-# Dockerfile.all-in-one. Build context is the PARENT of rusternetes/ so the
+# all-in-one.Dockerfile. Build context is the PARENT of rusternetes/ so the
 # rhino crate path (../../rhino from crates/storage) resolves correctly.
 # Cache the image; skip rebuild when it already exists (multi-minute compile).
 # ---------------------------------------------------------------------------
 AIO_IMAGE="mikronetes-aio:m2a"
-# deploy/m2a/Dockerfile.all-in-one-musl is a mikronetes-local variant of
-# rusternetes/Dockerfile.all-in-one that:
+# deploy/m2a/all-in-one-musl.Dockerfile is a mikronetes-local variant of
+# rusternetes/all-in-one.Dockerfile that:
 #   - Uses rust:1.95-alpine (musl toolchain) so the output is musl-statically
 #     linked — required for the Alpine/musl initramfs.
 #   - Fixes upstream bug: adds test_support to the dummy stub block
-#     (missing from rusternetes/Dockerfile.all-in-one; causes "no targets
+#     (missing from rusternetes/all-in-one.Dockerfile; causes "no targets
 #     specified in the manifest" at cargo build time).
 # Build context is the PARENT of rusternetes/ (same as upstream) so
 # rusternetes/rhino/ is accessible from the Dockerfile's COPY instructions.
-AIO_DOCKERFILE="$REPO_ROOT/deploy/m2a/Dockerfile.all-in-one-musl"
-if docker image inspect "$AIO_IMAGE" >/dev/null 2>&1; then
+AIO_DOCKERFILE="$REPO_ROOT/deploy/m2a/all-in-one-musl.Dockerfile"
+if [ "$REBUILD_AIO" != 1 ] && docker image inspect "$AIO_IMAGE" >/dev/null 2>&1; then
     echo "==> all-in-one image $AIO_IMAGE already present — skipping build"
 else
     echo "==> building musl-static all-in-one"
@@ -58,15 +156,49 @@ fi
 cid=$(docker create "$AIO_IMAGE")
 docker cp "$cid:/app/rusternetes" "$OUT/bin/rusternetes"
 docker rm "$cid" >/dev/null
+chmod 0755 "$OUT/bin/rusternetes"
+
+if [ "$REQUIRE_KUBELET" = 1 ]; then
+    KUBELET_IMAGE="mikronetes-kubelet:m2b"
+    if [ "$REBUILD_KUBELET" != 1 ] && docker image inspect "$KUBELET_IMAGE" >/dev/null 2>&1; then
+        echo "==> kubelet image $KUBELET_IMAGE already present — skipping build"
+    else
+        echo "==> building musl-static standalone kubelet"
+        docker build \
+            -f "$REPO_ROOT/deploy/m2a/kubelet-musl.Dockerfile" \
+            -t "$KUBELET_IMAGE" \
+            "$RUSTERNETES_PARENT"
+    fi
+    kid=$(docker create "$KUBELET_IMAGE")
+    docker cp "$kid:/app/kubelet" "$OUT/bin/kubelet"
+    docker rm "$kid" >/dev/null
+    chmod 0755 "$OUT/bin/kubelet"
+fi
 
 # ---------------------------------------------------------------------------
-# containerd-rs — pre-built musl-static binary from the M1 node-cdrs image.
+# containerd-rs — versioned musl-static release artifact.
 # ---------------------------------------------------------------------------
-echo "==> copying containerd-rs from $M1/deploy/node-cdrs/bin/containerd-rs"
-install -m0755 "$M1/deploy/node-cdrs/bin/containerd-rs" "$OUT/bin/containerd-rs"
+install_containerd_rs
+[ -f "$CA_CERT_BUNDLE" ] || {
+    echo "ERROR: CA_CERT_BUNDLE not found: $CA_CERT_BUNDLE" >&2
+    exit 1
+}
+install -m0644 "$CA_CERT_BUNDLE" "$OUT/ssl/certs/ca-certificates.crt"
+install_containerd_rs_wrapper
+
+for registry in 10.88.0.1:5000 10.88.0.1:5001; do
+    safe="${registry/:/_}_"
+    mkdir -p "$OUT/certs.d/$safe"
+    cat > "$OUT/certs.d/$safe/hosts.toml" <<TOML
+server = "http://${registry}"
+
+[host."http://${registry}"]
+capabilities = ["pull", "resolve"]
+TOML
+done
 
 # ---------------------------------------------------------------------------
-# crun (static) + runc symlink (containerd-rs execs "runc" by default).
+# crun (static OCI runtime). containerd-rs is configured to use crun directly.
 # Cache: skip download if already at target checksum path.
 # ---------------------------------------------------------------------------
 CRUN_URL="https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-amd64"
@@ -75,7 +207,6 @@ if [[ ! -x "$OUT/bin/crun" ]]; then
     curl -fsSL -o "$OUT/bin/crun" "$CRUN_URL"
     chmod +x "$OUT/bin/crun"
 fi
-ln -sf crun "$OUT/bin/runc"
 
 # ---------------------------------------------------------------------------
 # CNI plugins v1.9.1 (bridge, host-local, loopback, portmap) + flannel CNI v1.9.1-flannel1.
@@ -97,16 +228,27 @@ curl -fsSL "$FLANNEL_URL" | tar -xz -C "$tmp"
 install -m0755 "$tmp/flannel-amd64" "$OUT/cni/bin/flannel"
 
 # ---------------------------------------------------------------------------
-# Bootstrap CNI conflist — baked at /boot/cni/conf so boot-time sandboxes
-# (including the flannel DaemonSet pod itself) succeed before flannel installs
-# its own conflist. containerd-rs v0.1.3 invokes CNI for EVERY RunPodSandbox
-# including hostNetwork=true; without a conflist at cni_conf_dir, all fail.
+# Flannel CNI conflist — baked at /boot/cni/conf as the single active CNI.
+#
+# flannel-rs does NOT install a conflist itself (no upstream install-cni
+# initContainer); it only writes /run/flannel/subnet.env. So the flannel
+# conflist must be pre-placed here. The flannel plugin reads subnet.env and
+# delegates to bridge+host-local with THIS node's per-node subnet, so each
+# node hands out pod IPs from its own podCIDR (10.244.<n>.0/24).
+#
+# A static host-local bridge was baked here previously with a hardcoded
+# subnet 10.244.0.0/24 — identical on every node — which made all nodes hand
+# out 10.244.0.x and left the flannel chain unused. Replaced by the flannel
+# chain below (matches the kube-flannel-cfg ConfigMap's cni-conf.json).
+#
+# No chicken/egg: the flannel DaemonSet pod is hostNetwork=true (skips CNI
+# IPAM), and on ADD the flannel plugin returns try-again (code 11) if
+# subnet.env is not written yet, so kubelet simply retries the sandbox.
 # ---------------------------------------------------------------------------
-cat > "$OUT/cni/conf/10-bootstrap-bridge.conflist" <<'JSON'
-{ "cniVersion": "0.3.1", "name": "bootstrap", "plugins": [
-  { "type": "bridge", "bridge": "cni0", "isGateway": true, "ipMasq": false,
-    "ipam": { "type": "host-local", "subnet": "10.244.0.0/24",
-              "routes": [ { "dst": "0.0.0.0/0" } ] } } ] }
+cat > "$OUT/cni/conf/10-flannel.conflist" <<'JSON'
+{ "name": "cbr0", "cniVersion": "0.3.1", "plugins": [
+  { "type": "flannel", "delegate": { "hairpinMode": true, "isDefaultGateway": true } },
+  { "type": "portmap", "capabilities": { "portMappings": true } } ] }
 JSON
 
 # ---------------------------------------------------------------------------
@@ -169,8 +311,11 @@ fi
 # config.yaml is written by Task D1; skip that copy until D1 is done.
 # config-containerd-rs.toml is created in this task, copy it now.
 # ---------------------------------------------------------------------------
-cp "$REPO_ROOT/deploy/m2a/config.yaml" "$OUT/config.yaml"
+cp "$CONFIG_PATH" "$OUT/config.yaml"
 cp "$REPO_ROOT/deploy/m2a/config-containerd-rs.toml" "$OUT/config-containerd-rs.toml"
+if [ -n "$KUBECONFIG_PATH" ]; then
+    cp "$KUBECONFIG_PATH" "$OUT/kubelet.kubeconfig"
+fi
 
 echo ""
 echo "overlay assembled at $OUT"

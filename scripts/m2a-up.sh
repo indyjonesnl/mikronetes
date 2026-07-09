@@ -2,7 +2,7 @@
 # M2a single-node microVM boot harness.
 #
 # Brings up the M2a image (machined as PID 1, supervising containerd-rs +
-# rusternetes all-in-one) in a 512 MiB QEMU or cloud-hypervisor VM, then
+# rusternetes all-in-one) in a QEMU or cloud-hypervisor VM (default 512 MiB), then
 # waits until node-1 reports Ready via the Kubernetes API.
 #
 # Usage:
@@ -14,12 +14,14 @@
 #   OUT       output dir (default: <repo-root>/out)
 #   TAP       tap interface name (default: mkn0)
 #   CH_BIN    path to cloud-hypervisor binary (default: OUT/cloud-hypervisor)
+#   MEM       VM RAM in MiB (default: 512); bump to 1024 for image-heavy E2 tests
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${OUT:-$(cd "$SCRIPT_DIR/.." && pwd)/out}"
 BACKEND="${BACKEND:-qemu}"
 TAP="${TAP:-mkn0}"
+MEM="${MEM:-512}"
 
 KERNEL="$OUT/boot/vmlinuz"
 INITRD="$OUT/boot/initramfs.img"
@@ -56,7 +58,7 @@ case "$BACKEND" in
     say "launching QEMU (backend=qemu, KVM=$([ -n "$KVM" ] && echo on || echo off), serial=$SERIAL)"
     # shellcheck disable=SC2086  # KVM is an intentional word-split flag list.
     qemu-system-x86_64 $KVM \
-      -m 512 -smp 2 -machine q35 \
+      -m "$MEM" -smp 2 -machine q35 \
       -kernel "$KERNEL" -initrd "$INITRD" \
       -append "$CMDLINE" \
       -drive file="$IMG",if=virtio,format=raw,index=0 \
@@ -82,7 +84,7 @@ case "$BACKEND" in
       --kernel "$KERNEL" \
       --initramfs "$INITRD" \
       --cmdline "$CMDLINE" \
-      --memory size=512M \
+      --memory size="${MEM}M" \
       --cpus boot=2 \
       --disk path="$IMG" path="$OUT/state.img" \
       --net "tap=$TAP,mac=$MAC" \

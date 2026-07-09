@@ -1,25 +1,71 @@
 #!/usr/bin/env bash
-# M2a post-boot bootstrap: cluster resources + flannel DaemonSet + whoami test pod.
+# M2a post-boot bootstrap: cluster resources + CNI DaemonSet + whoami test pod.
 #
 # Run after scripts/m2a-up.sh confirms node-1 Ready.
-# Expected: flannel DS Ready ≥1, /run/flannel/subnet.env written, whoami Running.
+# Expected: CNI DS Ready ≥1 and whoami Running.
 #
 # Usage: bash scripts/m2a-bootstrap.sh
 #
 # Env overrides:
 #   VMIP          VM api-server IP (default: 10.88.0.2)
 #   RUSTERNETES_M1  path to rusternetes-m1 checkout (default: /home/jones/PhpstormProjects/rusternetes-m1)
+#   CNI_PLUGIN    flannel-rs (default). calico-rs can be added as another case.
+#   FLANNEL_IMAGE_SOURCE source image mirrored to 10.88.0.1:5000/flannel-rs:v0.1.3
+#   WHOAMI_IMAGE_SOURCE  source image mirrored to 10.88.0.1:5000/whoami:v1.10.2
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 M1="${RUSTERNETES_M1:-/home/jones/PhpstormProjects/rusternetes-m1}"
 VMIP="${VMIP:-10.88.0.2}"
+CNI_PLUGIN="${CNI_PLUGIN:-flannel-rs}"
+FLANNEL_IMAGE_SOURCE="${FLANNEL_IMAGE_SOURCE:-ghcr.io/indyjonesnl/flannel-rs:v0.1.3}"
+WHOAMI_IMAGE_SOURCE="${WHOAMI_IMAGE_SOURCE:-traefik/whoami:v1.10.2}"
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+case "$CNI_PLUGIN" in
+    flannel-rs)
+        CNI_NAME="flannel-rs"
+        CNI_NAMESPACE="kube-flannel"
+        CNI_DAEMONSET="kube-flannel-ds"
+        CNI_MANIFEST="$REPO_ROOT/deploy/m2a/flannel-rs.yaml"
+        CNI_POD_JSONPATH='{.items[0].metadata.name}'
+        ;;
+    calico-rs)
+        die "CNI_PLUGIN=calico-rs is recognized but no M2a calico-rs manifest is wired yet"
+        ;;
+    *)
+        die "unsupported CNI_PLUGIN '$CNI_PLUGIN' (supported: flannel-rs)"
+        ;;
+esac
+
 kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token dummy "$@"; }
+
+ensure_registry_image() {
+    local src="$1"
+    local dst="$2"
+    docker image inspect "$src" >/dev/null 2>&1 || docker pull "$src"
+    docker tag "$src" "localhost:5000/${dst}"
+    docker push "localhost:5000/${dst}" >/dev/null
+}
+
+ensure_local_registry() {
+    if ! docker ps --format '{{.Names}}' | grep -qx m2a-registry; then
+        if docker ps -a --format '{{.Names}}' | grep -qx m2a-registry; then
+            docker start m2a-registry >/dev/null
+        else
+            docker run -d --restart unless-stopped --name m2a-registry -p 5000:5000 registry:2 >/dev/null
+        fi
+    fi
+
+    say "mirroring M2a images into local registry"
+    ensure_registry_image "$FLANNEL_IMAGE_SOURCE" "flannel-rs:v0.1.3"
+    ensure_registry_image "$WHOAMI_IMAGE_SOURCE" "whoami:v1.10.2"
+}
+
+ensure_local_registry
 
 say "verifying node-1 Ready"
 st=$(kc get node node-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
@@ -75,40 +121,40 @@ say "node-1 podCIDR after patch: '${cidr_got}'"
 
 # Step 3 — flannel DaemonSet (M2a variant).
 # Key differences from M1's flannel-rs.yaml:
-#   - vxlan backend: flannel-rs v0.1.2 only supports vxlan; host-gw was added in
-#     v0.1.3. Using host-gw triggers Fatal::Backend → immediate exit(1).
+#   - vxlan backend: proven for M2a single-node smoke. host-gw exists in
+#     flannel-rs v0.1.3 but is not needed for this path.
 #   - KUBERNETES_SERVICE_HOST=127.0.0.1 (not 10.88.0.2): rusternetes generates
 #     a self-signed TLS cert with SANs [localhost, 127.0.0.1] only; the node IP
 #     10.88.0.2 is not in the SANs and rustls would reject it. flannel runs with
 #     hostNetwork=true so 127.0.0.1 is the node's loopback (reachable).
 #   - CNI conflist + binaries pre-placed in initramfs (no initContainer needed)
-#   - containerd-rs v0.1.3 DirectoryOrCreate not supported → run volume
+#   - containerd-rs DirectoryOrCreate may be unavailable → run volume
 #     pre-exists via rusternetes check_host_path_type + create_dir_all
-say "applying flannel-rs DaemonSet (M2a variant)"
-kc apply -f "$REPO_ROOT/deploy/m2a/flannel-rs.yaml"
+say "applying $CNI_NAME DaemonSet (M2a variant)"
+kc apply -f "$CNI_MANIFEST"
 
-say "waiting for flannel DS Ready (up to 5 min)"
+say "waiting for $CNI_NAME DS Ready (up to 5 min)"
 ok=0
 for _ in $(seq 1 60); do
-    r=$(kc get ds -n kube-flannel kube-flannel-ds -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+    r=$(kc get ds -n "$CNI_NAMESPACE" "$CNI_DAEMONSET" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
     [ "${r:-0}" -ge 1 ] && ok=1 && break
     sleep 5
 done
 
 if [ "$ok" != 1 ]; then
-    say "flannel not ready after 5 min; showing state for debugging:"
-    kc describe ds -n kube-flannel kube-flannel-ds 2>/dev/null || true
-    kc get pods -n kube-flannel -o wide 2>/dev/null || true
-    flannel_pod=$(kc get pods -n kube-flannel -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-    if [ -n "$flannel_pod" ]; then
-        say "=== flannel pod events ==="
-        kc describe pod -n kube-flannel "$flannel_pod" 2>/dev/null || true
-        say "=== flannel logs ==="
-        kc logs -n kube-flannel "$flannel_pod" 2>/dev/null || true
+    say "$CNI_NAME not ready after 5 min; showing state for debugging:"
+    kc describe ds -n "$CNI_NAMESPACE" "$CNI_DAEMONSET" 2>/dev/null || true
+    kc get pods -n "$CNI_NAMESPACE" -o wide 2>/dev/null || true
+    cni_pod=$(kc get pods -n "$CNI_NAMESPACE" -o jsonpath="$CNI_POD_JSONPATH" 2>/dev/null || echo "")
+    if [ -n "$cni_pod" ]; then
+        say "=== $CNI_NAME pod events ==="
+        kc describe pod -n "$CNI_NAMESPACE" "$cni_pod" 2>/dev/null || true
+        say "=== $CNI_NAME logs ==="
+        kc logs -n "$CNI_NAMESPACE" "$cni_pod" 2>/dev/null || true
     fi
-    die "flannel DS not Ready; see above for diagnostics"
+    die "$CNI_NAME DS not Ready; see above for diagnostics"
 fi
-say "flannel DS Ready"
+say "$CNI_NAME DS Ready"
 
 # Step 4 — the whoami test pod.
 say "launching whoami test pod"
@@ -143,13 +189,10 @@ if [ -n "$pod_ip" ]; then
         && say "curl OK" \
         || say "curl failed (pod IP may not be routable from host; check pod logs instead)"
 
-    say "verifying whoami is reachable inside the VM via exec into flannel pod:"
-    flannel_pod=$(kc get pods -n kube-flannel -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-    if [ -n "$flannel_pod" ]; then
-        kc exec -n kube-flannel "$flannel_pod" -- wget -qO- --timeout=5 "http://${pod_ip}:80" 2>/dev/null \
-            && say "in-cluster curl OK" \
-            || say "in-cluster curl failed"
-    fi
+    say "verifying whoami is reachable from host via pod CIDR route:"
+    curl -sf --max-time 5 "http://${pod_ip}:80" >/dev/null \
+        && say "host-to-pod curl OK" \
+        || die "host-to-pod curl failed"
 fi
 
 say "bootstrap complete"
