@@ -19,30 +19,54 @@ rhino-SQLite storage) fit inside node-1's 512 MiB and correctly serve a
 DaemonSet workload behind a load-balanced Service, with cluster state
 surviving a control-plane restart?**
 
+## Milestone Split
+
+Research into the codebase (rusternetes, machined-rs) showed the
+netfilter/iptables enablement is a separable, higher-risk subsystem. M2c is
+therefore split into two independently-testable plans:
+
+- **M2c-0 — Services work on the microVM.** Get iptables userspace + the
+  netfilter module closure into the guest image, enable the all-in-one's
+  embedded kube-proxy + DNS on node-1, add a standalone kube-proxy host
+  service on each worker, and prove a ClusterIP Service load-balances across
+  nodes and DNS resolves — using the existing `whoami` workload. This retires
+  the netfilter risk in isolation.
+- **M2c-1 — PHP DaemonSet + durability.** Switch node-1's storage to
+  rhino-SQLite on the persistent STATE partition, replace `whoami` with the
+  placeholder PHP `DaemonSet` on the three workers, and add the full
+  `m2c-smoke.sh` including the kill/relaunch durability test.
+
+This document is the shared design for both. Each plan is written separately.
+
 ## Scope and Decisions
 
 Locked during brainstorming:
 
 - **Platform:** x86_64 Cloud-Hypervisor microVMs, extending the M2b harness on
-  the dev box. Fast to iterate, CI-friendly. The aarch64 / Raspberry Pi 3A+
-  port is explicitly deferred to a later milestone.
-- **Storage backend:** rhino-SQLite — the storage crate's native
-  `sqlite = ["dep:rhino"]` path. Dogfoods the all-Rust stack, lightest
-  footprint, no Go process. Because rhino is unproven end-to-end, M2c includes
-  a durability test. Kine-on-SQLite remains the conservative fallback if the
-  durability test fails, but is not wired in M2c.
+  the dev box. The aarch64 / Raspberry Pi 3A+ port is deferred to a later
+  milestone.
+- **Storage backend:** rhino-SQLite — selected at runtime by the all-in-one's
+  `--storage-backend sqlite` (already the default) with the DB path set by
+  `--data-dir`. rhino hardcodes WAL journal mode + `synchronous = NORMAL`
+  (`rhino/src/drivers/sqlite/mod.rs`); this is not configurable from
+  rusternetes. NORMAL is safe against a clean process kill (the M2c-1
+  durability test); true power-loss safety (`synchronous = FULL`) would require
+  a rhino change and is out of scope. Kine-on-SQLite remains the conservative
+  fallback if the durability test fails; not wired in M2c.
 - **Workload:** a placeholder PHP image (prints its hostname / pod IP), run as
   a DaemonSet on the three worker nodes, fronted by a ClusterIP Service.
   Verification is in-cluster: DNS resolves the Service name and repeated
   requests to the ClusterIP load-balance across all three pods. Not the user's
   real website, and no external (NodePort/Ingress) exposure — both deferred.
 - **Control-plane composition:** all-in-one — a single `rusternetes` binary on
-  node-1 embedding api-server + scheduler + controller-manager + DNS, as in
-  M2b, now with the `sqlite` storage feature enabled and the
-  DaemonSet/Service/endpoints controllers active. A split-services layout costs
-  more processes and RAM on a 512 MiB node with no benefit here.
-- **kube-proxy:** the `kube-proxy` crate's iptables(-nft) backend, run as a
-  DaemonSet on all four nodes.
+  node-1 that already embeds api-server + scheduler + controller-manager +
+  kubelet + kube-proxy + DNS. M2b disabled the last two via
+  `--disable-proxy --disable-dns`; M2c drops those flags to enable them.
+- **kube-proxy:** the `rusternetes-kube-proxy` iptables(-nft) backend, run as a
+  **host process**, not a DaemonSet — embedded in the all-in-one on node-1, and
+  as a standalone machined **service** on each worker (API mode, mirroring how
+  the standalone kubelet already runs). No kube-proxy image or DaemonSet
+  manifest.
 
 ## Architecture
 
@@ -50,69 +74,93 @@ Same four-node layout as M2b (`10.88.0.2`–`10.88.0.5` on bridge `mkn-br0`,
 host-gw flannel, per-node podCIDRs `10.244.0/1/2/3.0/24`), extended:
 
 - **node-1 — control-plane, tainted `NoSchedule`:** `rusternetes` all-in-one
-  with `sqlite`(rhino) storage, embedded DNS at `10.96.0.10`, plus
-  containerd-rs / crun / flannel. The rhino-SQLite database lives on the
-  per-node **persistent** `state.img` (e.g. `/var/lib/rusternetes/state.db`),
-  not the ephemeral rootfs, so it survives a node-1 reboot. A kube-proxy
-  DaemonSet pod also runs here (it tolerates the taint).
-- **node-2 / node-3 / node-4 — workers:** standalone kubelet + containerd-rs /
-  crun / flannel + a kube-proxy DaemonSet pod + **one PHP pod each**.
-- **Workload:** a placeholder PHP `DaemonSet` (nodeSelector / no CP toleration
-  so it lands only on the three workers) + a ClusterIP `Service` selecting it;
-  a DNS `A` record resolves the service name to the ClusterIP.
+  with embedded kube-proxy + DNS enabled and `--cluster-cidr 10.244.0.0/16`,
+  storage `--storage-backend sqlite --data-dir /system/state/rusternetes/state.db`
+  on the persistent **STATE** partition (see Persistence), plus
+  containerd-rs / crun / flannel.
+- **node-2 / node-3 / node-4 — workers:** standalone kubelet + a standalone
+  `kube-proxy` machined service (API mode) + containerd-rs / crun / flannel +
+  **one PHP pod each** (M2c-1).
+- **Workload (M2c-1):** a placeholder PHP `DaemonSet` (nodeSelector / no CP
+  toleration so it lands only on the three workers) + a ClusterIP `Service`
+  selecting it; a DNS `A` record resolves the service name to the ClusterIP.
 - **CNI:** unchanged from M2b — flannel host-gw, per-node podCIDRs.
+
+## Persistence
+
+machined does **not** mount the second disk (`state.img` / `vdb`) the harness
+attaches — there is no data-disk mount mechanism today, and using `vdb` would
+require new machined code (out of scope). Persistence instead uses the install
+disk's **STATE** partition (`/system/state`, ext4, ~1 GiB), which machined
+already provisions and mounts and which already persists PKI across reboots.
+The rhino-SQLite DB lives at `/system/state/rusternetes/state.db`. It survives
+the M2c-1 kill/relaunch durability test (the provisioner leaves an
+already-laid-out disk untouched); it is only wiped by an explicit
+`machinectl reset`.
 
 ## Components
 
 New or changed relative to M2b:
 
-1. **rusternetes all-in-one, storage = `sqlite`(rhino).** The all-in-one image
-   is built with the `sqlite` feature
-   (`api-server/sqlite → rusternetes-storage/sqlite → rhino`). The DB path is a
-   persistent location on `state.img`. `config.yaml` gains a storage-backend
-   stanza pointing at that path. SQLite runs in **WAL** mode with
-   `synchronous = FULL` so a hard kill cannot tear a committed write.
-2. **Embedded DNS**, served at `10.96.0.10:53` (kubelet already advertises this
-   resolver to pods, confirmed in M2b logs). Answers `A` for
-   `<svc>.<ns>.svc.cluster.local`.
-3. **kube-proxy DaemonSet.** A new musl-static image built from the `kube-proxy`
-   crate, mirrored into the local registry like flannel. Runs `hostNetwork`,
-   privileged, tolerating all taints so it is present on all four nodes.
-   iptables(-nft) backend.
-4. **Netfilter module set**, packaged into the image and added to
-   `modules.load`: `nf_tables`, `nf_nat`, `nf_conntrack`, `nft_compat` /
-   `x_tables`, `nft_chain_nat`. The guest kernel (Alpine linux-virt 6.12.93)
-   already ships these as modules (`nf_* = m`); M2b's
-   `iptables (nf_tables): Could not fetch rule set generation id` failure was
-   modules-not-loaded, not an unsupported kernel. This is a bounded
-   module-wiring task, not a kernel rebuild.
-5. **Controllers** (already in `controller-manager`, activated in all-in-one):
-   `daemonset`, `service`, `endpoints` / `endpointslice`.
-6. **Workload manifests:** the placeholder PHP `DaemonSet` and its ClusterIP
-   `Service`. The PHP image is mirrored into the local registry.
+1. **iptables userspace in the guest rootfs.** kube-proxy shells out to
+   `/usr/sbin/iptables-nft` and `iptables-restore` (auto-detecting the backend).
+   The minimal Alpine rootfs the imager builds has no iptables. Add pinned
+   Alpine `apk` artifacts — `iptables` plus its NEEDED-lib closure (`libnftnl`,
+   `libmnl`) — to `machined-rs/crates/imager/artifacts.toml`, following the
+   existing e2fsprogs closure pattern. They extract into the initramfs rootfs
+   at `/usr/sbin/`.
+2. **Netfilter module closure.** `bridge`, `br_netfilter`, `nf_tables`,
+   `nf_nat`, `nf_conntrack` are already in `VIRT_MODULES`
+   (`machined-rs/crates/imager/src/modules.rs`). Add the iptables-nft
+   translation + match/target modules kube-proxy needs (`nft_compat`,
+   `nft_chain_nat`, and the `xt_*` modules its rules use — e.g. `xt_comment`,
+   `xt_mark`, `xt_conntrack`, `xt_statistic`). The imager resolves
+   dependencies transitively from the kernel package's `modules.dep` and fails
+   the build loudly if a named module is absent, so the exact set is confirmed
+   by building. machined `finit_module`s them in dependency order at boot (no
+   runtime modprobe / autoload).
+3. **rusternetes all-in-one config change (node-1).** Drop
+   `--disable-proxy` and `--disable-dns`; add `--cluster-cidr 10.244.0.0/16`;
+   set `--data-dir /system/state/rusternetes/state.db`. DNS binds `0.0.0.0:53`
+   and is reached by pods via the `--cluster-dns 10.96.0.10` ClusterIP, which
+   the embedded kube-proxy DNATs.
+4. **Standalone kube-proxy on workers.** Build a musl-static `kube-proxy`
+   binary (`cargo build --profile release-fast --features sqlite -p
+   rusternetes-kube-proxy`, or without `sqlite` in API mode; `mimalloc`
+   recommended for musl), stage it into the worker overlay at `/boot/bin/kube-proxy`,
+   and add a `ServiceConfig` to each worker's generated `config.yaml`:
+   `command = ["/boot/bin/kube-proxy", "--node-name", "node-N", "--kubeconfig",
+   "/boot/kubelet.kubeconfig", "--api-server-url", "https://10.88.0.2:6443",
+   "--insecure-skip-tls-verify", "true", "--cluster-cidr", "10.244.0.0/16"]`.
+5. **Controllers** (already in `controller-manager`, active in all-in-one):
+   `daemonset`, `service`, `endpoints` / `endpointslice`. Confirmed:
+   a Service with a pod selector produces an EndpointSlice populated with
+   matching pod IPs; DNS serves `A` for `<svc>.<ns>.svc.cluster.local`.
+6. **Workload manifests (M2c-1):** the placeholder PHP `DaemonSet` and its
+   ClusterIP `Service`. The PHP image is mirrored into the local registry.
 7. **Scripts:** `scripts/m2c-bootstrap.sh` (extends m2b — taint node-1, apply
-   the kube-proxy DaemonSet, the PHP DaemonSet, and the Service) and
-   `scripts/m2c-smoke.sh`.
+   the Service and, in M2c-1, the PHP DaemonSet) and `scripts/m2c-smoke.sh`.
 
 ## Data Flow
 
 ```
-boot       node-1 rusternetes -> open rhino-SQLite on state.img -> serve API + DNS(10.96.0.10)
-           workers' kubelets register
-bootstrap  patch per-node podCIDRs (m2b) -> flannel host-gw DS -> kube-proxy DS ->
-           taint node-1 NoSchedule -> apply PHP DaemonSet + ClusterIP Service
-schedule   daemonset ctrl -> 1 PHP pod per worker (node-1 excluded by taint)
-           kubelet pulls PHP image (local registry) -> flannel assigns per-node pod IP
-endpoints  service + endpointslice ctrl -> EndpointSlice = {3 PHP pod IPs}
+boot       node-1 rusternetes -> open rhino-SQLite on /system/state -> serve API + DNS(0.0.0.0:53)
+           embedded kube-proxy programs iptables (incl. 10.96.0.10 -> DNS)
+           workers' kubelets + kube-proxy services register / program local iptables
+bootstrap  patch per-node podCIDRs (m2b) -> flannel host-gw DS ->
+           taint node-1 NoSchedule -> apply DaemonSet + ClusterIP Service
+schedule   daemonset ctrl -> 1 pod per worker (node-1 excluded by taint)
+           kubelet pulls image (local registry) -> flannel assigns per-node pod IP
+endpoints  service + endpointslice ctrl -> EndpointSlice = {pod IPs}
 proxy      kube-proxy on each node watches Service + EndpointSlice ->
-           iptables DNAT: ClusterIP:80 -> {podIP1,2,3}, load-balanced
-serve      client pod: nslookup <svc> -> ClusterIP;  wget ClusterIP:80 xN -> all 3 pods hit
+           iptables DNAT: ClusterIP:80 -> {podIPs}, load-balanced
+serve      client pod: nslookup <svc> -> ClusterIP;  wget ClusterIP:80 xN -> all pods hit
 durable    kill + relaunch node-1 -> CP reopens SQLite DB -> API state intact, pods still Running
 ```
 
 The load-bearing new links are **EndpointSlice → kube-proxy → iptables DNAT**
-(the Service load-balancer) and **rusternetes → rhino-SQLite on persistent
-disk** (state durability).
+(the Service load-balancer) and **rusternetes → rhino-SQLite on the STATE
+partition** (state durability).
 
 ## Image Distribution
 
@@ -123,7 +171,7 @@ does not run in the guest.
 
 For M2c the registry is the standard OCI **Distribution** registry
 (`registry:2`) run as a Docker container on the dev box — harness plumbing
-only, exactly as in M2b. The node runtime is unchanged by this choice.
+only, as in M2b. The node runtime is unchanged by this choice.
 
 k0s/k3s parity note: neither ships a registry; they pull from the image's own
 registry, import airgap tarballs into containerd, or point the runtime at a
@@ -138,37 +186,44 @@ Each failure mode maps to a gate assertion so failures are loud, not silent:
 
 | Failure | Symptom | Caught by |
 |---|---|---|
-| netfilter modules not loaded | kube-proxy iptables backend won't init | kube-proxy pod not Ready / no `KUBE-SVC` chains |
+| netfilter modules missing / image build | build aborts (`module <name> not found in modules.dep`) | image build fails |
+| iptables userspace missing | kube-proxy can't exec `/usr/sbin/iptables-nft` | kube-proxy logs error; no `KUBE-`/`RUSTERNETES-` chains |
+| netfilter modules not loaded at boot | iptables-restore fails | Service load-balancing check fails |
 | rhino-SQLite open or corrupt | control plane fails fast at boot | node-1 never Ready |
-| power-loss mid-write | inconsistent DB | durability phase |
-| node-1 taint missing | a 4th PHP pod lands on the CP | PHP pod count != 3 |
+| clean-kill mid-write | last txns lost, DB intact (WAL) | durability phase asserts prior committed state present |
+| node-1 taint missing | a 4th PHP pod lands on the CP | pod count != 3 |
 | Service has 0 endpoints | endpointslice controller not populating | load-balancing check fails |
-| registry unreachable | PHP pod `ImagePullBackOff` | pod-Running wait fails |
+| registry unreachable | pod `ImagePullBackOff` | pod-Running wait fails |
 | DNS not serving | pods cannot resolve the service | nslookup check fails |
 
 ## Smoke Gate
 
-`scripts/m2c-smoke.sh` extends the six M2b steps with:
+`scripts/m2c-smoke.sh` extends the six M2b steps.
 
-1. **Control-plane composition** — API reachable; the storage backend is SQLite
-   (assert `state.db` exists and is non-empty on node-1's persistent disk); DNS
-   serving on `10.96.0.10`.
-2. **kube-proxy** — DaemonSet Ready on all four nodes; the Service has an
-   EndpointSlice with exactly three endpoints.
-3. **PHP DaemonSet** — exactly **three** pods, one per worker, **none on
+M2c-0 assertions:
+
+1. **kube-proxy up** — node-1 all-in-one started with proxy+DNS enabled; each
+   worker's `kube-proxy` service is running (serial log / process present).
+2. **Service + endpoints** — the ClusterIP Service has an EndpointSlice with
+   the expected number of endpoints.
+3. **DNS** — from a client pod, `nslookup <svc>.<ns>.svc.cluster.local`
+   returns the ClusterIP.
+4. **Service load-balancing** — from a client pod, `wget http://<ClusterIP>:80`
+   repeated N times returns **all distinct backend pod identities** (proves
+   kube-proxy DNAT + cross-node spread).
+
+M2c-1 adds:
+
+5. **CP composition** — storage backend is SQLite (assert
+   `/system/state/rusternetes/state.db` exists and is non-empty on node-1).
+6. **PHP DaemonSet** — exactly **three** pods, one per worker, **none on
    node-1** (taint honored), all Running; per-node pod IPs within each node's
    podCIDR and globally distinct (reusing M2b's step 3b assertion).
-4. **DNS** — from a client pod, `nslookup <svc>.<ns>.svc.cluster.local`
-   returns the ClusterIP.
-5. **Service load-balancing** — from a client pod, `wget http://<ClusterIP>:80`
-   repeated N times returns **all three distinct PHP pod identities** (proves
-   kube-proxy DNAT and cross-node spread).
-6. **Durability (the rhino proof)** — snapshot API state (nodes, PHP pods,
+7. **Durability (the rhino proof)** — snapshot API state (nodes, PHP pods,
    Service, EndpointSlice); kill and relaunch node-1; wait for the API to
    return; assert the **same resources are present** (control plane recovered
    from rhino-SQLite), PHP pods still Running, and load-balancing still works.
-   This phase is destructive and slow, so it runs last, as its own phase; the
-   rest of the gate stays fast.
+   Runs last, as its own phase.
 
 Memory reporting extends the M2b per-node / per-application table: add
 `kube-proxy` and the PHP process (`php-fpm` / `apache2`) to the memprobe's
@@ -178,31 +233,30 @@ unchanged.
 
 ## Success Criteria
 
-M2c passes when:
+M2c-0 passes when a ClusterIP Service load-balances real cross-node traffic
+across its backend pods and DNS resolves the Service name from inside a pod,
+with kube-proxy programming iptables on every node.
 
-- node-1 runs the full control plane (api-server + scheduler +
-  controller-manager + DNS + rhino-SQLite storage) inside 512 MiB with no OOM.
-- The PHP DaemonSet runs exactly three pods, one per worker, none on node-1.
-- One ClusterIP Service load-balances real cross-node traffic across all three
-  PHP pods.
-- DNS resolves the Service name to its ClusterIP from inside a pod.
-- Cluster state survives a node-1 restart (rhino-SQLite durability).
-- Per-node / per-application memory is reported at boot-peak and idle.
+M2c-1 passes when, additionally: node-1 runs the full control plane on
+rhino-SQLite inside 512 MiB with no OOM; the PHP DaemonSet runs exactly three
+pods (one per worker, none on node-1); cluster state survives a node-1
+restart; and per-node / per-application memory is reported at boot-peak and
+idle.
 
 ## Out of Scope / Follow-ups
 
-- **aarch64 / Raspberry Pi 3A+ port** — arm64 builds, USB-Ethernet image, real
-  hardware. A later milestone; M2c is the x86_64 proving ground.
-- **External exposure** — NodePort / Ingress / LoadBalancer for reaching the
-  site from outside the cluster.
-- **The real PHP website** — actual app image, assets, secrets, and any backing
-  datastore.
+- **aarch64 / Raspberry Pi 3A+ port** — arm64 builds (the aarch64 artifact set
+  already exists in `artifacts.toml`), USB-Ethernet image, real hardware.
+- **External exposure** — NodePort / Ingress / LoadBalancer.
+- **The real PHP website** — actual app image, assets, secrets, datastore.
+- **`synchronous = FULL`** — true power-loss durability; needs a rhino change to
+  thread the pragma through `SqliteConfig`.
+- **Mounting the `state.img` second disk** — needs new machined code (disk
+  selection + label→mountpoint mapping); M2c uses the STATE partition instead.
 - **Kine fallback** — wire Kine-on-SQLite only if the rhino durability test
   fails.
-- **containerd-rs airgap import** — a tarball / OCI-layout import path so a
-  fixed workload can run with no registry at all (containerd-rs is currently
-  pull-only). Needed for the Pi airgap story; a containerd-rs work item.
-- **Self-hosted LAN registry for Pi** — Zot or Distribution on the LAN, with
-  each node's `hosts.toml` pointed at it (replaces the dev-box Docker registry).
-- **High availability** — single control-plane node, single copy of state on
-  microSD; no multi-CP / raft. Accept restore-from-backup as DR.
+- **containerd-rs airgap import** — tarball / OCI-layout import so a fixed
+  workload runs with no registry (containerd-rs is currently pull-only).
+- **Self-hosted LAN registry for Pi** — Zot or Distribution on the LAN.
+- **High availability** — single control-plane node, single copy of state; no
+  multi-CP / raft. Restore-from-backup as DR.
