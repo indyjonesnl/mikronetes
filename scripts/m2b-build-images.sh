@@ -50,10 +50,15 @@ echo "==> assembling shared worker overlay"
 CONFIG_PATH="$OUT/configs/node-2.yaml" \
   KUBECONFIG_PATH="$OUT/configs/kubelet.kubeconfig" \
   REQUIRE_KUBELET=1 \
+  REQUIRE_KUBEPROXY=1 \
   OUT="$WORKER_OVERLAY" \
   bash "$SCRIPT_DIR/m2a-build-overlay.sh"
 [ -x "$WORKER_OVERLAY/bin/kubelet" ] || {
   echo "ERROR: $WORKER_OVERLAY/bin/kubelet missing; rebuild mikronetes-kubelet:m2b with updated Dockerfile" >&2
+  exit 1
+}
+[ -x "$WORKER_OVERLAY/bin/kube-proxy" ] || {
+  echo "ERROR: $WORKER_OVERLAY/bin/kube-proxy missing; rebuild mikronetes-kube-proxy:m2c" >&2
   exit 1
 }
 

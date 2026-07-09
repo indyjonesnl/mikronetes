@@ -12,8 +12,10 @@
 #   CONFIG_PATH     — machine config copied to /boot/config.yaml
 #   KUBECONFIG_PATH — optional kubelet kubeconfig copied to /boot/kubelet.kubeconfig
 #   REQUIRE_KUBELET — when 1, copy/build standalone kubelet for worker overlays
+#   REQUIRE_KUBEPROXY — when 1, copy/build standalone kube-proxy for worker overlays
 #   REBUILD_AIO     — when 1, rebuild mikronetes-aio:m2a even if the image tag exists
 #   REBUILD_KUBELET — when 1, rebuild mikronetes-kubelet:m2b even if the image tag exists
+#   REBUILD_KUBEPROXY — when 1, rebuild mikronetes-kube-proxy:m2c even if the image tag exists
 #   CONTAINERD_RS_VERSION — GitHub release tag to install (default: v0.2.0)
 #   CONTAINERD_RS_ARCH    — release arch override: amd64 or arm64 (default: host arch)
 #   CONTAINERD_RS_BIN     — local containerd-rs binary override, skips release download
@@ -34,8 +36,10 @@ OUT="${OUT:-$REPO_ROOT/out/overlay}"
 CONFIG_PATH="${CONFIG_PATH:-$REPO_ROOT/deploy/m2a/config.yaml}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-}"
 REQUIRE_KUBELET="${REQUIRE_KUBELET:-0}"
+REQUIRE_KUBEPROXY="${REQUIRE_KUBEPROXY:-0}"
 REBUILD_AIO="${REBUILD_AIO:-0}"
 REBUILD_KUBELET="${REBUILD_KUBELET:-0}"
+REBUILD_KUBEPROXY="${REBUILD_KUBEPROXY:-0}"
 CONTAINERD_RS_VERSION="${CONTAINERD_RS_VERSION:-v0.2.0}"
 CONTAINERD_RS_ARCH="${CONTAINERD_RS_ARCH:-}"
 CONTAINERD_RS_BIN="${CONTAINERD_RS_BIN:-}"
@@ -173,6 +177,23 @@ if [ "$REQUIRE_KUBELET" = 1 ]; then
     docker cp "$kid:/app/kubelet" "$OUT/bin/kubelet"
     docker rm "$kid" >/dev/null
     chmod 0755 "$OUT/bin/kubelet"
+fi
+
+if [ "$REQUIRE_KUBEPROXY" = 1 ]; then
+    KUBEPROXY_IMAGE="mikronetes-kube-proxy:m2c"
+    if [ "$REBUILD_KUBEPROXY" != 1 ] && docker image inspect "$KUBEPROXY_IMAGE" >/dev/null 2>&1; then
+        echo "==> kube-proxy image $KUBEPROXY_IMAGE already present — skipping build"
+    else
+        echo "==> building musl-static standalone kube-proxy"
+        docker build \
+            -f "$REPO_ROOT/deploy/m2a/kube-proxy-musl.Dockerfile" \
+            -t "$KUBEPROXY_IMAGE" \
+            "$RUSTERNETES_PARENT"
+    fi
+    kpid=$(docker create "$KUBEPROXY_IMAGE")
+    docker cp "$kpid:/app/kube-proxy" "$OUT/bin/kube-proxy"
+    docker rm "$kpid" >/dev/null
+    chmod 0755 "$OUT/bin/kube-proxy"
 fi
 
 # ---------------------------------------------------------------------------
