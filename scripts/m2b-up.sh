@@ -95,7 +95,7 @@ launch_ch() {
     --cmdline "$CMDLINE" \
     --memory size="${mem}M" \
     --cpus boot=2 \
-    --disk path="$node_dir/m2b.img" path="$node_dir/state.img" \
+    --disk path="$node_dir/m2b.img",image_type=raw path="$node_dir/state.img",image_type=raw \
     --net "tap=$tap,mac=$mac" \
     --serial tty \
     --console off \

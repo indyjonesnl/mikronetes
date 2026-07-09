@@ -28,7 +28,7 @@ say "relaunching node-1 (mem=${MEM}MiB, tap=mkn0) — state.img + m2b.img persis
 nohup setsid "$CH_BIN" \
   --kernel "$KERNEL" --initramfs "$INITRD" --cmdline "$CMDLINE" \
   --memory size="${MEM}M" --cpus boot=2 \
-  --disk path="$node_dir/m2b.img" path="$node_dir/state.img" \
+  --disk path="$node_dir/m2b.img",image_type=raw path="$node_dir/state.img",image_type=raw \
   --net "tap=mkn0,mac=52:55:00:88:00:02" \
   --serial tty --console off --api-socket "$node_dir/ch.sock" \
   >> "$serial" 2>&1 &
