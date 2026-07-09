@@ -71,6 +71,11 @@ machine:
         - /var/lib/rusternetes/volumes
         - --cluster-cidr
         - 10.244.0.0/16
+        # Cluster DNS is served by the native rusternetes-dns Deployment (behind
+        # the kube-dns Service @10.96.0.10), so the all-in-one's embedded DNS is
+        # redundant here — disable it to save node-1 memory. Embedded kube-proxy
+        # stays ENABLED (node-1 needs local Service iptables like every node).
+        - --disable-dns
       depends_on: [containerd]
       restart: always
       env:
