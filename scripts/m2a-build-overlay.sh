@@ -16,7 +16,7 @@
 #   REBUILD_AIO     — when 1, rebuild mikronetes-aio:m2a even if the image tag exists
 #   REBUILD_KUBELET — when 1, rebuild mikronetes-kubelet:m2b even if the image tag exists
 #   REBUILD_KUBEPROXY — when 1, rebuild mikronetes-kube-proxy:m2c even if the image tag exists
-#   CONTAINERD_RS_VERSION — GitHub release tag to install (default: v0.2.0)
+#   CONTAINERD_RS_VERSION — GitHub release tag to install (default: v0.3.0)
 #   CONTAINERD_RS_ARCH    — release arch override: amd64 or arm64 (default: host arch)
 #   CONTAINERD_RS_BIN     — local containerd-rs binary override, skips release download
 #   CONTAINERD_RS_CACHE   — release artifact cache dir (default: <repo-root>/out/cache/containerd-rs)
@@ -40,7 +40,7 @@ REQUIRE_KUBEPROXY="${REQUIRE_KUBEPROXY:-0}"
 REBUILD_AIO="${REBUILD_AIO:-0}"
 REBUILD_KUBELET="${REBUILD_KUBELET:-0}"
 REBUILD_KUBEPROXY="${REBUILD_KUBEPROXY:-0}"
-CONTAINERD_RS_VERSION="${CONTAINERD_RS_VERSION:-v0.2.0}"
+CONTAINERD_RS_VERSION="${CONTAINERD_RS_VERSION:-v0.3.0}"
 CONTAINERD_RS_ARCH="${CONTAINERD_RS_ARCH:-}"
 CONTAINERD_RS_BIN="${CONTAINERD_RS_BIN:-}"
 CONTAINERD_RS_CACHE="${CONTAINERD_RS_CACHE:-$REPO_ROOT/out/cache/containerd-rs}"

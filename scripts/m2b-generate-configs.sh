@@ -83,6 +83,13 @@ machine:
         - { key: RUST_MIN_STACK, value: "8388608" }
         - { key: PATH, value: "/boot/bin:/usr/bin:/bin" }
         - { key: CONTAINER_RUNTIME_ENDPOINT, value: "unix:///run/containerd-rs.sock" }
+        # kubelet rewrites the CRI exec/attach stream URL to this host:port
+        # (rusternetes cri::stream::stream_target). Default is "containerd" (a
+        # compose service name) which doesn't resolve in the microVM; the
+        # streaming server binds 0.0.0.0:10010 on THIS node, so point it at
+        # loopback. Without this, kubectl exec/attach fail with
+        # "streamproxy proxy_upgrade: client error (Connect)".
+        - { key: CONTAINERD_STREAM_HOST, value: "127.0.0.1" }
 YAML
 }
 
@@ -154,6 +161,13 @@ YAML
         - { key: RUST_LOG, value: info }
         - { key: PATH, value: "/boot/bin:/usr/bin:/bin" }
         - { key: CONTAINER_RUNTIME_ENDPOINT, value: "unix:///run/containerd-rs.sock" }
+        # kubelet rewrites the CRI exec/attach stream URL to this host:port
+        # (rusternetes cri::stream::stream_target). Default is "containerd" (a
+        # compose service name) which doesn't resolve in the microVM; the
+        # streaming server binds 0.0.0.0:10010 on THIS node, so point it at
+        # loopback. Without this, kubectl exec/attach fail with
+        # "streamproxy proxy_upgrade: client error (Connect)".
+        - { key: CONTAINERD_STREAM_HOST, value: "127.0.0.1" }
     - id: kube-proxy
       command:
         - /boot/bin/kube-proxy
