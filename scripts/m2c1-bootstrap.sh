@@ -20,7 +20,9 @@ bash "$SCRIPT_DIR/m2c-bootstrap.sh"
 # Custom + tiny on purpose: the official php images (Debian ~500MB / cli-alpine)
 # either trip containerd-rs's unpacker or fill the worker's small disk (ENOSPC).
 say "ensuring $PHP_IMAGE_TAG in the local registry"
-if ! docker image inspect "$PHP_IMAGE_TAG" >/dev/null 2>&1; then
+# Arch-aware guard: rebuild if the cached image arch differs from wanted, else
+# an amd64-cached :m2c image would be mirrored into an arm64 cluster.
+if [ "$(docker image inspect "$PHP_IMAGE_TAG" --format '{{.Architecture}}' 2>/dev/null || true)" != "${PLATFORM#linux/}" ]; then
   docker build --platform "$PLATFORM" -f "$REPO_ROOT/deploy/m2c/php-alpine.Dockerfile" -t "$PHP_IMAGE_TAG" "$REPO_ROOT"
 fi
 docker tag "$PHP_IMAGE_TAG" "localhost:${REGISTRY_HOST_PORT}/mikronetes-php:m2c"

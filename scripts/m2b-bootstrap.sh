@@ -24,7 +24,10 @@ kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token 
 ensure_registry_image() {
   local src="$1"
   local dst="$2"
-  docker image inspect "$src" >/dev/null 2>&1 || docker pull --platform "$POD_PLATFORM" "$src"
+  # Arch-aware guard: re-pull if the cached image arch differs from wanted, else
+  # an amd64-cached image would be mirrored into an arm64 cluster.
+  [ "$(docker image inspect "$src" --format '{{.Architecture}}' 2>/dev/null || true)" = "${POD_PLATFORM#linux/}" ] \
+    || docker pull --platform "$POD_PLATFORM" "$src"
   docker tag "$src" "localhost:${REGISTRY_HOST_PORT}/${dst}"
   docker push "localhost:${REGISTRY_HOST_PORT}/${dst}" >/dev/null
 }

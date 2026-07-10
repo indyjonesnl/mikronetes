@@ -38,7 +38,9 @@ bash "$SCRIPT_DIR/m2b-bootstrap.sh"
 #    Dockerfile that COPYs crates wholesale.
 # ---------------------------------------------------------------------------
 say "ensuring rusternetes-dns image in the local registry"
-if ! docker image inspect "$DNS_IMAGE_TAG" >/dev/null 2>&1; then
+# Arch-aware guard: rebuild if the cached image is a different arch than wanted,
+# else an amd64-cached :m2c image would be mirrored into an arm64 cluster.
+if [ "$(docker image inspect "$DNS_IMAGE_TAG" --format '{{.Architecture}}' 2>/dev/null || true)" != "${PLATFORM#linux/}" ]; then
   docker build \
     --platform "$PLATFORM" \
     -f "$REPO_ROOT/deploy/m2a/rusternetes-dns-musl.Dockerfile" \
