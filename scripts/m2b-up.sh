@@ -30,10 +30,12 @@ done
 ensure_taps_free() {
   local busy=0
   local tap
+  local pat
   for tap in mkn0 mkn1 mkn2 mkn3; do
-    if pgrep -af "qemu-system-x86_64 .*ifname=${tap}|cloud-hypervisor .*tap=${tap}" >/dev/null 2>&1; then
+    pat="qemu-system-x86_64 .*ifname=${tap}|qemu-system-aarch64 .*ifname=${tap}|cloud-hypervisor .*tap=${tap}"
+    if pgrep -af "$pat" >/dev/null 2>&1; then
       echo "ERROR: tap $tap is already owned by a running VM:" >&2
-      pgrep -af "qemu-system-x86_64 .*ifname=${tap}|cloud-hypervisor .*tap=${tap}" >&2 || true
+      pgrep -af "$pat" >&2 || true
       busy=1
     fi
   done
