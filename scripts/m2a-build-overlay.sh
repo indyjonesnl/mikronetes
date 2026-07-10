@@ -46,6 +46,18 @@ CONTAINERD_RS_BIN="${CONTAINERD_RS_BIN:-}"
 CONTAINERD_RS_CACHE="${CONTAINERD_RS_CACHE:-$REPO_ROOT/out/cache/containerd-rs}"
 CONTAINERD_RS_INSECURE_REGISTRIES="${CONTAINERD_RS_INSECURE_REGISTRIES:-}"
 CA_CERT_BUNDLE="${CA_CERT_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+# Target platform for the musl overlay image cross-builds (docker buildx).
+# Default linux/amd64 == today's implicit host-arch build on an amd64 host
+# (rust:1.95-alpine / alpine:3.21 are multi-arch); set PLATFORM=linux/arm64 to
+# cross-build the arm64 overlay images under the arm64 binfmt emulation.
+PLATFORM="${PLATFORM:-linux/amd64}"
+# When cross-building arm64 overlay images, tag them :m2d-arm64 so they do not
+# clobber the amd64 :m2a/:m2b/:m2c tags. Empty for amd64 -> keep existing tags.
+if [ "$PLATFORM" = "linux/arm64" ]; then
+    OVERLAY_IMAGE_TAG="m2d-arm64"
+else
+    OVERLAY_IMAGE_TAG=""
+fi
 rm -rf "$OUT"
 mkdir -p "$OUT/bin" "$OUT/certs.d" "$OUT/cni/bin" "$OUT/cni/conf" "$OUT/pki/k8s" "$OUT/ssl/certs"
 
@@ -135,7 +147,7 @@ C
 # rhino crate path (../../rhino from crates/storage) resolves correctly.
 # Cache the image; skip rebuild when it already exists (multi-minute compile).
 # ---------------------------------------------------------------------------
-AIO_IMAGE="mikronetes-aio:m2a"
+AIO_IMAGE="mikronetes-aio:${OVERLAY_IMAGE_TAG:-m2a}"
 # deploy/m2a/all-in-one-musl.Dockerfile is a mikronetes-local variant of
 # rusternetes/all-in-one.Dockerfile that:
 #   - Uses rust:1.95-alpine (musl toolchain) so the output is musl-statically
@@ -153,44 +165,47 @@ else
     echo "    dockerfile: $AIO_DOCKERFILE"
     echo "    build context: $RUSTERNETES_PARENT"
     docker build \
+        --platform "$PLATFORM" \
         -f "$AIO_DOCKERFILE" \
         -t "$AIO_IMAGE" \
         "$RUSTERNETES_PARENT"
 fi
-cid=$(docker create "$AIO_IMAGE")
+cid=$(docker create --platform "$PLATFORM" "$AIO_IMAGE")
 docker cp "$cid:/app/rusternetes" "$OUT/bin/rusternetes"
 docker rm "$cid" >/dev/null
 chmod 0755 "$OUT/bin/rusternetes"
 
 if [ "$REQUIRE_KUBELET" = 1 ]; then
-    KUBELET_IMAGE="mikronetes-kubelet:m2b"
+    KUBELET_IMAGE="mikronetes-kubelet:${OVERLAY_IMAGE_TAG:-m2b}"
     if [ "$REBUILD_KUBELET" != 1 ] && docker image inspect "$KUBELET_IMAGE" >/dev/null 2>&1; then
         echo "==> kubelet image $KUBELET_IMAGE already present — skipping build"
     else
         echo "==> building musl-static standalone kubelet"
         docker build \
+            --platform "$PLATFORM" \
             -f "$REPO_ROOT/deploy/m2a/kubelet-musl.Dockerfile" \
             -t "$KUBELET_IMAGE" \
             "$RUSTERNETES_PARENT"
     fi
-    kid=$(docker create "$KUBELET_IMAGE")
+    kid=$(docker create --platform "$PLATFORM" "$KUBELET_IMAGE")
     docker cp "$kid:/app/kubelet" "$OUT/bin/kubelet"
     docker rm "$kid" >/dev/null
     chmod 0755 "$OUT/bin/kubelet"
 fi
 
 if [ "$REQUIRE_KUBEPROXY" = 1 ]; then
-    KUBEPROXY_IMAGE="mikronetes-kube-proxy:m2c"
+    KUBEPROXY_IMAGE="mikronetes-kube-proxy:${OVERLAY_IMAGE_TAG:-m2c}"
     if [ "$REBUILD_KUBEPROXY" != 1 ] && docker image inspect "$KUBEPROXY_IMAGE" >/dev/null 2>&1; then
         echo "==> kube-proxy image $KUBEPROXY_IMAGE already present — skipping build"
     else
         echo "==> building musl-static standalone kube-proxy"
         docker build \
+            --platform "$PLATFORM" \
             -f "$REPO_ROOT/deploy/m2a/kube-proxy-musl.Dockerfile" \
             -t "$KUBEPROXY_IMAGE" \
             "$RUSTERNETES_PARENT"
     fi
-    kpid=$(docker create "$KUBEPROXY_IMAGE")
+    kpid=$(docker create --platform "$PLATFORM" "$KUBEPROXY_IMAGE")
     docker cp "$kpid:/app/kube-proxy" "$OUT/bin/kube-proxy"
     docker rm "$kpid" >/dev/null
     chmod 0755 "$OUT/bin/kube-proxy"

@@ -17,6 +17,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REGISTRY_HOST_PORT="${REGISTRY_HOST_PORT:-5000}"
 REGISTRY_ENDPOINT="${REGISTRY_ENDPOINT:-10.88.0.1:${REGISTRY_HOST_PORT}}"
 DNS_IMAGE_TAG="${DNS_IMAGE_TAG:-rusternetes-dns:m2c}"
+# Cross-build platform for the in-repo rusternetes-dns image. Default
+# linux/amd64 reproduces today's host-arch build; set PLATFORM=linux/arm64 to
+# build the arm64 variant (rust:1.95-alpine base is multi-arch).
+PLATFORM="${PLATFORM:-linux/amd64}"
 
 say() { printf '\n==> %s\n' "$*"; }
 kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token dummy "$@"; }
@@ -36,6 +40,7 @@ bash "$SCRIPT_DIR/m2b-bootstrap.sh"
 say "ensuring rusternetes-dns image in the local registry"
 if ! docker image inspect "$DNS_IMAGE_TAG" >/dev/null 2>&1; then
   docker build \
+    --platform "$PLATFORM" \
     -f "$REPO_ROOT/deploy/m2a/rusternetes-dns-musl.Dockerfile" \
     -t "$DNS_IMAGE_TAG" \
     "$RUSTERNETES_PARENT"

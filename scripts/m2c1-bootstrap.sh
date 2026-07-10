@@ -6,6 +6,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VMIP="${VMIP:-10.88.0.2}"
 REGISTRY_HOST_PORT="${REGISTRY_HOST_PORT:-5000}"
 PHP_IMAGE_TAG="${PHP_IMAGE_TAG:-mikronetes-php:m2c}"
+# Cross-build platform for the in-repo php-alpine image. Default linux/amd64
+# reproduces today's host-arch build; set PLATFORM=linux/arm64 for the arm64
+# variant so the PHP DaemonSet runs on aarch64 nodes.
+PLATFORM="${PLATFORM:-linux/amd64}"
 say() { printf '\n==> %s\n' "$*"; }
 kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token dummy "$@"; }
 
@@ -17,7 +21,7 @@ bash "$SCRIPT_DIR/m2c-bootstrap.sh"
 # either trip containerd-rs's unpacker or fill the worker's small disk (ENOSPC).
 say "ensuring $PHP_IMAGE_TAG in the local registry"
 if ! docker image inspect "$PHP_IMAGE_TAG" >/dev/null 2>&1; then
-  docker build -f "$REPO_ROOT/deploy/m2c/php-alpine.Dockerfile" -t "$PHP_IMAGE_TAG" "$REPO_ROOT"
+  docker build --platform "$PLATFORM" -f "$REPO_ROOT/deploy/m2c/php-alpine.Dockerfile" -t "$PHP_IMAGE_TAG" "$REPO_ROOT"
 fi
 docker tag "$PHP_IMAGE_TAG" "localhost:${REGISTRY_HOST_PORT}/mikronetes-php:m2c"
 docker push "localhost:${REGISTRY_HOST_PORT}/mikronetes-php:m2c" >/dev/null
