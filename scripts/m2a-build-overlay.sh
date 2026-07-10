@@ -222,7 +222,8 @@ done
 # crun (static OCI runtime). containerd-rs is configured to use crun directly.
 # Cache: skip download if already at target checksum path.
 # ---------------------------------------------------------------------------
-CRUN_URL="https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-amd64"
+CRUN_ARCH="${CRUN_ARCH:-amd64}"   # amd64 | arm64
+CRUN_URL="https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-${CRUN_ARCH}"
 if [[ ! -x "$OUT/bin/crun" ]]; then
     echo "==> downloading crun 1.28"
     curl -fsSL -o "$OUT/bin/crun" "$CRUN_URL"
