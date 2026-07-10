@@ -12,6 +12,10 @@ WHOAMI_IMAGE_SOURCE="${WHOAMI_IMAGE_SOURCE:-traefik/whoami:v1.10.2}"
 BUSYBOX_IMAGE_SOURCE="${BUSYBOX_IMAGE_SOURCE:-busybox:1.36.1}"
 REGISTRY_HOST_PORT="${REGISTRY_HOST_PORT:-5000}"
 REGISTRY_ENDPOINT="${REGISTRY_ENDPOINT:-10.88.0.1:${REGISTRY_HOST_PORT}}"
+# Platform for the externally-sourced pod/CNI image mirror pulls (busybox,
+# whoami, flannel-rs). Default linux/amd64 == today's host-arch pull; set
+# POD_PLATFORM=linux/arm64 so the arm64 manifests land in the local registry.
+POD_PLATFORM="${POD_PLATFORM:-linux/amd64}"
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -20,7 +24,7 @@ kc() { kubectl --server "https://$VMIP:6443" --insecure-skip-tls-verify --token 
 ensure_registry_image() {
   local src="$1"
   local dst="$2"
-  docker image inspect "$src" >/dev/null 2>&1 || docker pull "$src"
+  docker image inspect "$src" >/dev/null 2>&1 || docker pull --platform "$POD_PLATFORM" "$src"
   docker tag "$src" "localhost:${REGISTRY_HOST_PORT}/${dst}"
   docker push "localhost:${REGISTRY_HOST_PORT}/${dst}" >/dev/null
 }
