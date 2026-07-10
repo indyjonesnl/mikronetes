@@ -71,6 +71,31 @@ launch_qemu() {
     -daemonize
 }
 
+launch_qemu_aarch64() {
+  local node="$1" tap="$2" mac="$3"
+  local node_dir="$OUT/$node"
+  local serial="$node_dir/serial.log"
+  local mem="$MEM"
+  [ "$node" = node-1 ] && mem="$CONTROL_PLANE_MEM"
+  mkdir -p "$node_dir"
+  [ -f "$node_dir/state.img" ] || truncate -s 2G "$node_dir/state.img"
+  rm -f "$node_dir/ch.sock"
+  : > "$serial"
+  say "launching $node with QEMU aarch64 (mem=${mem}MiB, tap=$tap, serial=$serial)"
+  qemu-system-aarch64 \
+    -M virt -cpu cortex-a53 -smp 2 \
+    -m "$mem" \
+    -kernel "$KERNEL" -initrd "$INITRD" \
+    -append "console=ttyAMA0 root=/dev/ram0 rw" \
+    -drive file="$node_dir/m2b.img",if=virtio,format=raw,index=0 \
+    -drive file="$node_dir/state.img",if=virtio,format=raw,index=1 \
+    -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
+    -device virtio-net-pci,netdev=n0,mac="$mac" \
+    -nographic \
+    -serial "file:$serial" \
+    -daemonize
+}
+
 launch_ch() {
   local node="$1" tap="$2" mac="$3"
   local node_dir="$OUT/$node"
@@ -123,8 +148,14 @@ case "$BACKEND" in
     launch_ch node-3 mkn2 52:55:00:88:00:04
     launch_ch node-4 mkn3 52:55:00:88:00:05
     ;;
+  qemu-aarch64)
+    launch_qemu_aarch64 node-1 mkn0 52:55:00:88:00:02
+    launch_qemu_aarch64 node-2 mkn1 52:55:00:88:00:03
+    launch_qemu_aarch64 node-3 mkn2 52:55:00:88:00:04
+    launch_qemu_aarch64 node-4 mkn3 52:55:00:88:00:05
+    ;;
   *)
-    die "unknown BACKEND '$BACKEND' (supported: qemu | ch)"
+    die "unknown BACKEND '$BACKEND' (supported: qemu | ch | qemu-aarch64)"
     ;;
 esac
 
