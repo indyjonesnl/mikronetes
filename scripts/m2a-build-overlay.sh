@@ -46,6 +46,9 @@ CONTAINERD_RS_BIN="${CONTAINERD_RS_BIN:-}"
 CONTAINERD_RS_CACHE="${CONTAINERD_RS_CACHE:-$REPO_ROOT/out/cache/containerd-rs}"
 CONTAINERD_RS_INSECURE_REGISTRIES="${CONTAINERD_RS_INSECURE_REGISTRIES:-}"
 CA_CERT_BUNDLE="${CA_CERT_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+# Arch of the native CNI plugin + flannel-shim ELF binaries (amd64|arm64).
+# Threaded from m2b-build-images.sh (ARCH); default amd64 == today.
+CNI_ARCH="${CNI_ARCH:-amd64}"
 # Target platform for the musl overlay image cross-builds (docker buildx).
 # Default linux/amd64 == today's implicit host-arch build on an amd64 host
 # (rust:1.95-alpine / alpine:3.21 are multi-arch); set PLATFORM=linux/arm64 to
@@ -248,21 +251,25 @@ fi
 # ---------------------------------------------------------------------------
 # CNI plugins v1.9.1 (bridge, host-local, loopback, portmap) + flannel CNI v1.9.1-flannel1.
 # ---------------------------------------------------------------------------
-echo "==> downloading CNI plugins v1.9.1 + flannel CNI v1.9.1-flannel1"
+echo "==> downloading CNI plugins v1.9.1 ($CNI_ARCH) + flannel CNI v1.9.1-flannel1 ($CNI_ARCH)"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-CNI_URL="https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz"
+# The CNI plugin + flannel-shim binaries are NATIVE ELF, exec'd directly by
+# containerd-rs on every pod sandbox setup (not container images -> guest binfmt
+# does not apply). They MUST match the node arch or every pod ADD/DEL
+# exec-format-errors. CNI_ARCH is threaded from m2b-build-images.sh (ARCH).
+CNI_URL="https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-${CNI_ARCH}-v1.9.1.tgz"
 curl -fsSL "$CNI_URL" | tar -xz -C "$tmp"
 install -m0755 "$tmp/bridge"     "$OUT/cni/bin/bridge"
 install -m0755 "$tmp/host-local" "$OUT/cni/bin/host-local"
 install -m0755 "$tmp/loopback"   "$OUT/cni/bin/loopback"
 install -m0755 "$tmp/portmap"    "$OUT/cni/bin/portmap"
 
-FLANNEL_URL="https://github.com/flannel-io/cni-plugin/releases/download/v1.9.1-flannel1/cni-plugin-flannel-linux-amd64-v1.9.1.tgz"
+FLANNEL_URL="https://github.com/flannel-io/cni-plugin/releases/download/v1.9.1-flannel1/cni-plugin-flannel-linux-${CNI_ARCH}-v1.9.1.tgz"
 curl -fsSL "$FLANNEL_URL" | tar -xz -C "$tmp"
-# The archive extracts to flannel-amd64 (not cni-plugin).
-install -m0755 "$tmp/flannel-amd64" "$OUT/cni/bin/flannel"
+# The archive extracts to flannel-<arch> (not cni-plugin).
+install -m0755 "$tmp/flannel-${CNI_ARCH}" "$OUT/cni/bin/flannel"
 
 # ---------------------------------------------------------------------------
 # Flannel CNI conflist — baked at /boot/cni/conf as the single active CNI.

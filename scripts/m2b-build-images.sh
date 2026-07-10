@@ -17,7 +17,7 @@ ARCH="${ARCH:-x86_64}"
 # :m2d-arm64 overlay image tags). Left unset for x86_64 so the amd64 overlay
 # build is byte-for-byte unchanged.
 if [ "$ARCH" = aarch64 ]; then
-  export CONTAINERD_RS_ARCH=arm64 CRUN_ARCH=arm64 PLATFORM=linux/arm64
+  export CONTAINERD_RS_ARCH=arm64 CRUN_ARCH=arm64 CNI_ARCH=arm64 PLATFORM=linux/arm64
 fi
 
 mkdir -p "$OUT/boot"
