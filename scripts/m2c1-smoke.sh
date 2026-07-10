@@ -35,7 +35,7 @@ spec:
       echo "backends=\$c"; [ "\$c" -ge 2 ]
 YAML
   local ph ec
-  for _ in $(seq 1 60); do ph=$(kc get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null); { [ "$ph" = Succeeded ] || [ "$ph" = Failed ]; } && break; sleep 2; done
+  for _ in $(seq 1 $((60 * ${WAIT_SCALE:-1}))); do ph=$(kc get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null); { [ "$ph" = Succeeded ] || [ "$ph" = Failed ]; } && break; sleep 2; done
   ec=$(kc get pod "$1" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)
   kc delete pod "$1" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   echo "${ec:-timeout}"

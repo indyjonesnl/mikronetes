@@ -27,14 +27,14 @@ kc apply -f "$REPO_ROOT/deploy/m2c/php-daemonset.yaml"
 
 say "waiting for 3 php-web pods Running (one per worker)"
 ok=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 $((60 * ${WAIT_SCALE:-1}))); do
   n=$(kc get pods -l app=php-web --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w)
   [ "${n:-0}" -ge 3 ] && ok=1 && break
   sleep 5
 done
 [ "$ok" = 1 ] || { kc get pods -l app=php-web -o wide || true; echo "ERROR: php-web not at 3 Running" >&2; exit 1; }
 say "waiting for web Service ClusterIP + endpoints"
-for _ in $(seq 1 30); do
+for _ in $(seq 1 $((30 * ${WAIT_SCALE:-1}))); do
   cip=$(kc get svc web -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo)
   [ -n "$cip" ] && [ "$cip" != None ] && break
   sleep 2

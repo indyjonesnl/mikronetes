@@ -163,7 +163,7 @@ kc() { kubectl --server "https://10.88.0.2:6443" --insecure-skip-tls-verify --to
 
 say "waiting for node-1 API and Ready condition (up to ~8m)"
 ok=0
-for _ in $(seq 1 96); do
+for _ in $(seq 1 $((96 * ${WAIT_SCALE:-1}))); do
   st=$(kc get node node-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo)
   if [ "$st" = True ]; then ok=1; break; fi
   sleep 5
@@ -177,7 +177,7 @@ fi
 say "node-1 Ready; waiting for worker nodes to register"
 for node in node-2 node-3 node-4; do
   ok=0
-  for _ in $(seq 1 72); do
+  for _ in $(seq 1 $((72 * ${WAIT_SCALE:-1}))); do
     st=$(kc get node "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo)
     if [ "$st" = True ]; then ok=1; break; fi
     sleep 5
