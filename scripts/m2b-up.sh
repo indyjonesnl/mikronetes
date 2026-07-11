@@ -93,7 +93,7 @@ launch_qemu_aarch64() {
     -drive file="$node_dir/state.img",if=virtio,format=raw,index=1 \
     -netdev tap,id=n0,ifname="$tap",script=no,downscript=no \
     -device virtio-net-pci,netdev=n0,mac="$mac" \
-    -nographic \
+    -display none \
     -serial "file:$serial" \
     -daemonize
 }
