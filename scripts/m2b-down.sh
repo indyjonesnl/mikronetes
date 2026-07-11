@@ -21,7 +21,7 @@ for node in node-1 node-2 node-3 node-4; do
   fi
 done
 
-{ pgrep -af "qemu-system-x86_64 .*${OUT}/node-[1-4]/m2b.img" || true; } \
+{ pgrep -af "qemu-system-(x86_64|aarch64) .*${OUT}/node-[1-4]/m2b.img" || true; } \
   | awk '{print $1}' \
   | while read -r pid; do
       [ -n "$pid" ] || continue
