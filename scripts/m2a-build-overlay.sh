@@ -110,11 +110,18 @@ install_containerd_rs() {
 }
 
 install_containerd_rs_wrapper() {
-    local cc="${CC:-musl-gcc}"
+    # The wrapper is a native ELF exec'd by machined as the containerd service,
+    # so it MUST match the node arch. Default to musl-gcc (amd64); for arm64
+    # cross-compile a static aarch64 binary (static glibc runs on the musl
+    # image — no dynamic loader, no NSS in this shim). CC override still wins.
+    local cc="${CC:-}"
+    if [ -z "$cc" ]; then
+        if [ "$CNI_ARCH" = arm64 ]; then cc="aarch64-linux-gnu-gcc"; else cc="musl-gcc"; fi
+    fi
     local src="$OUT/containerd-rs-mikronetes.c"
 
     if ! command -v "$cc" >/dev/null 2>&1; then
-        echo "ERROR: $cc not found; install musl-tools or set CC to a static-capable compiler" >&2
+        echo "ERROR: $cc not found; install musl-tools (amd64) / gcc-aarch64-linux-gnu (arm64) or set CC to a static-capable compiler" >&2
         exit 1
     fi
 
