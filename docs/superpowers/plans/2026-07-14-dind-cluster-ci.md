@@ -48,10 +48,15 @@
 - [ ] **Step 2: Create `deploy/dind/config-containerd-rs.toml`** (adapted from `deploy/m2a/config-containerd-rs.toml` to container FS paths)
 
 ```toml
+# Aligned to the fork's PROVEN containerd-rs-in-a-container config
+# (scripts/k0s-diff/containerd-rs.toml on fork main). Insecure registries are
+# supplied via the CONTAINERD_RS_INSECURE_REGISTRIES env (set in entrypoint.sh),
+# NOT a certs.d dir — containerd-rs has no local-image load path, so all images
+# are pulled over HTTP from the local registry.
 root = "/var/lib/containerd-rs"
 state = "/run/containerd-rs"
 cri_socket = "/run/containerd-rs.sock"
-stream_server_address = "0.0.0.0:10010"
+stream_server_address = "127.0.0.1:10010"
 
 [cri]
 sandbox_image = "10.88.0.1:5000/pause:3.10"
@@ -59,10 +64,8 @@ default_runtime_name = "crun"
 runtime_type = "io.containerd.crun.v2"
 snapshotter = "overlayfs"
 systemd_cgroup = false
-registry_config_path = "/etc/containerd-rs/certs.d"
-cni_conf_dir = "/opt/cni/conf"
+cni_conf_dir = "/etc/cni/net.d"
 cni_bin_dir = "/opt/cni/bin"
-no_pivot_root = true
 ```
 
 - [ ] **Step 3: Create `deploy/dind/entrypoint.sh`**
@@ -78,7 +81,10 @@ NODE_NAME="${NODE_NAME:-$(hostname)}"
 CP="${CP_ENDPOINT:-https://10.88.0.2:6443}"
 PKI=/etc/rusternetes/pki
 KCFG=/etc/rusternetes/kubeconfig
+REGISTRY="${REGISTRY:-10.88.0.1:5000}"
 mkdir -p /var/log/rusternetes /var/lib/rusternetes
+# containerd-rs / crun want a machine-id; the slim base has none.
+[ -s /etc/machine-id ] || { dd if=/dev/urandom bs=16 count=1 status=none | md5sum | cut -d' ' -f1 > /etc/machine-id; }
 
 wait_for() { # $1=desc $2=cmd
   for _ in $(seq 1 90); do eval "$2" >/dev/null 2>&1 && return 0; sleep 1; done
@@ -86,7 +92,10 @@ wait_for() { # $1=desc $2=cmd
 }
 
 start_containerd_rs() {
-  mkdir -p /var/lib/containerd-rs /run/containerd-rs
+  mkdir -p /var/lib/containerd-rs /run/containerd-rs /etc/cni/net.d
+  # containerd-rs has no local-image load path — allow HTTP pulls from the
+  # local registry (mechanism proven in scripts/k0s-diff).
+  export CONTAINERD_RS_INSECURE_REGISTRIES="$REGISTRY"
   containerd-rs --config /etc/containerd-rs/config.toml \
     >/var/log/rusternetes/containerd-rs.log 2>&1 &
   wait_for "containerd-rs socket" '[ -S /run/containerd-rs.sock ]' || exit 1
@@ -142,7 +151,7 @@ ARG CRUN_ARCH=amd64
 ARG CONTAINERD_RS_ARCH=amd64
 ARG CONTAINERD_RS_VERSION=v0.3.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      iptables ca-certificates curl openssl && rm -rf /var/lib/apt/lists/*
+      iptables iproute2 ca-certificates curl openssl && rm -rf /var/lib/apt/lists/*
 
 # rusternetes binaries (fork multi-arch images; /app/<name>)
 COPY --from=src-apiserver  /app/api-server         /usr/local/bin/api-server
@@ -158,20 +167,16 @@ RUN curl -fsSL "https://github.com/indyjonesnl/containerd-rs/releases/download/$
       "https://github.com/containers/crun/releases/download/1.28/crun-1.28-linux-${CRUN_ARCH}" \
  && chmod +x /usr/local/bin/containerd-rs /usr/local/bin/crun
 
-# CNI plugins + flannel shim
-RUN mkdir -p /opt/cni/bin /opt/cni/conf \
+# CNI plugins + flannel shim. Conflist goes in containerd-rs's cni_conf_dir
+# (/etc/cni/net.d, per the proven k0s-diff config).
+RUN mkdir -p /opt/cni/bin /etc/cni/net.d \
  && curl -fsSL "https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-${CNI_ARCH}-v1.9.1.tgz" \
       | tar -xz -C /opt/cni/bin \
  && curl -fsSL "https://github.com/flannel-io/cni-plugin/releases/download/v1.9.1-flannel1/cni-plugin-flannel-linux-${CNI_ARCH}-v1.9.1.tgz" \
       | tar -xz -C /tmp \
  && mv "/tmp/flannel-${CNI_ARCH}" /opt/cni/bin/flannel
-COPY deploy/dind/10-flannel.conflist        /opt/cni/conf/10-flannel.conflist
+COPY deploy/dind/10-flannel.conflist        /etc/cni/net.d/10-flannel.conflist
 COPY deploy/dind/config-containerd-rs.toml  /etc/containerd-rs/config.toml
-
-# Insecure local-registry config for containerd-rs (certs.d hosts.toml)
-RUN mkdir -p "/etc/containerd-rs/certs.d/10.88.0.1:5000" \
- && printf 'server = "http://10.88.0.1:5000"\n\n[host."http://10.88.0.1:5000"]\n  capabilities = ["pull", "resolve"]\n' \
-      > "/etc/containerd-rs/certs.d/10.88.0.1:5000/hosts.toml"
 
 # Baked CI-only PKI + insecure kubeconfig (server 10.88.0.2 for all roles)
 RUN mkdir -p /etc/rusternetes/pki && cd /etc/rusternetes/pki \
@@ -202,7 +207,7 @@ docker build -f deploy/dind/node.Dockerfile \
   --build-arg CNI_ARCH=amd64 --build-arg CRUN_ARCH=amd64 --build-arg CONTAINERD_RS_ARCH=amd64 \
   -t mikronetes-node:dind-test .
 docker run --rm --entrypoint sh mikronetes-node:dind-test -c \
-  'for b in api-server scheduler controller-manager kubelet kube-proxy containerd-rs crun; do command -v $b || { echo MISSING $b; exit 1; }; done; ls /opt/cni/bin/flannel /opt/cni/conf/10-flannel.conflist /etc/rusternetes/pki/server.crt /etc/rusternetes/kubeconfig'
+  'for b in api-server scheduler controller-manager kubelet kube-proxy containerd-rs crun; do command -v $b || { echo MISSING $b; exit 1; }; done; ls /opt/cni/bin/flannel /etc/cni/net.d/10-flannel.conflist /etc/rusternetes/pki/server.crt /etc/rusternetes/kubeconfig'
 ```
 Expected: all seven binaries resolve; the CNI + PKI + kubeconfig paths list without error.
 
@@ -268,29 +273,44 @@ networks:
   mikronetes-net:
     driver: bridge
     ipam: { config: [{ subnet: 10.88.0.0/24 }] }
+# `cgroup: host`, `tmpfs: /run`, and the `dns:` override mirror the fork's
+# proven containerd-rs-in-a-container harness (scripts/k0s-diff/compose.k0s-v0.yml):
+# containerd-rs + crun need host cgroup access + a writable /run, and the dns
+# override avoids the kind-style resolv.conf rewrite. registry publishes 5000 on
+# the host loopback so `dind-up.sh` can seed it with a plain `docker push`.
 services:
   registry:
     image: registry:2
+    ports: [ "127.0.0.1:5000:5000" ]
     networks: { mikronetes-net: { ipv4_address: 10.88.0.1 } }
   node-1:
     image: ${NODE_IMAGE:-mikronetes-node:dind}
     privileged: true
+    cgroup: host
     hostname: node-1
     environment: { ROLE: control-plane, NODE_NAME: node-1 }
+    tmpfs: [ /run ]
+    dns: [ 8.8.8.8, 1.1.1.1 ]
     networks: { mikronetes-net: { ipv4_address: 10.88.0.2 } }
   node-2:
     image: ${NODE_IMAGE:-mikronetes-node:dind}
     privileged: true
+    cgroup: host
     hostname: node-2
     environment: { ROLE: worker, NODE_NAME: node-2 }
+    tmpfs: [ /run ]
+    dns: [ 8.8.8.8, 1.1.1.1 ]
     volumes: [ /lib/modules:/lib/modules:ro ]
     networks: { mikronetes-net: { ipv4_address: 10.88.0.3 } }
     depends_on: [ node-1 ]
   node-3:
     image: ${NODE_IMAGE:-mikronetes-node:dind}
     privileged: true
+    cgroup: host
     hostname: node-3
     environment: { ROLE: worker, NODE_NAME: node-3 }
+    tmpfs: [ /run ]
+    dns: [ 8.8.8.8, 1.1.1.1 ]
     volumes: [ /lib/modules:/lib/modules:ro ]
     networks: { mikronetes-net: { ipv4_address: 10.88.0.4 } }
     depends_on: [ node-1 ]
@@ -319,19 +339,13 @@ say "waiting for CP api-server"
 for _ in $(seq 1 90); do kc get --raw /healthz >/dev/null 2>&1 && break; sleep 2; done
 kc get --raw /healthz >/dev/null 2>&1 || { echo "api-server never healthy" >&2; exit 1; }
 
-say "seeding local registry (arch-matched) via the host docker"
+say "seeding local registry (arch-matched) at localhost:5000"
+for _ in $(seq 1 30); do curl -sf http://localhost:5000/v2/ >/dev/null 2>&1 && break; sleep 1; done
 seed() { # $1=src $2=dst
   docker pull ${POD_PLATFORM:+--platform "$POD_PLATFORM"} "$1"
-  docker tag "$1" "localhost:5000/$2"; docker push "localhost:5000/$2" >/dev/null
+  docker tag "$1" "localhost:5000/$2"
+  docker push "localhost:5000/$2" >/dev/null
 }
-# registry is reachable on the host as localhost:5000 via the container's mapped
-# port; publish it by connecting the host docker to the compose network:
-REG_CID=$($COMPOSE ps -q registry)
-docker network connect bridge "$REG_CID" 2>/dev/null || true
-# push through the registry container's published address
-docker exec "$REG_CID" true  # ensure up
-# NOTE: seed via `docker save | docker exec ... registry import` is avoided;
-# instead publish host->registry over the compose net using its gateway alias.
 for pair in "traefik/whoami:v1.10.2 whoami:v1.10.2" \
             "busybox:1.36.1 busybox:1.36.1" \
             "registry.k8s.io/pause:3.10 pause:3.10" \
@@ -375,10 +389,6 @@ done
 kc get nodes,pods -A -o wide || true
 say "dind cluster up"
 ```
-
-Note: the registry-seeding block above must publish images the node containerd-rs can pull at `10.88.0.1:5000`. Implement seeding by mapping the registry container's port to the host (`ports: ["5000:5000"]` on the registry service — add it) and pushing to `localhost:5000`; node pulls resolve `10.88.0.1:5000` on the compose net. Update `compose.dind.yml` registry service with `ports: ["127.0.0.1:5000:5000"]` and drop the `docker network connect`/`docker exec` lines in favor of straight `docker push localhost:5000/...`.
-
-- [ ] **Step 3b: Simplify seeding** — edit `compose.dind.yml` registry service to add `ports: ["127.0.0.1:5000:5000"]`; in `dind-up.sh` replace the seeding block's `REG_CID`/`network connect`/`docker exec` lines with just the `seed()` loop (push to `localhost:5000`).
 
 - [ ] **Step 4: `bash -n` + bring the cluster up locally**
 
@@ -609,11 +619,11 @@ git push origin HEAD
 
 **Deviation from spec (noted):** the spec text said "3 nodes Ready"; the componentized CP has no kubelet, so it is not a k8s node — the cluster has **2 worker nodes** + a CP container. The Services-parity LB across 2 workers is unaffected. Smoke asserts 2 workers Ready.
 
-**Placeholder scan:** Task 2 Step 3 intentionally carries a corrective note + Step 3b to simplify the registry seeding to host `localhost:5000` push (the inline `docker network connect`/`docker exec` lines are replaced) — the implementer must apply Step 3b so the final `dind-up.sh` seeds via `localhost:5000` with the registry service publishing `127.0.0.1:5000:5000`. No other placeholders.
+**Placeholder scan:** none. Registry seeding is a straight `docker push localhost:5000/…` (the compose registry publishes `127.0.0.1:5000:5000`).
 
 **Type/name consistency:** `kc()` (server 10.88.0.2:6443, insecure, token dummy), `VMIP=10.88.0.2`, node names `node-1`(CP)/`node-2`/`node-3`, podCIDRs 10.244.1.0/24 & 10.244.2.0/24, registry `10.88.0.1:5000`, `NODE_IMAGE`/`ROLE`/`NODE_NAME`/`RUSTERNETES_IMAGE_TAG` used consistently across Dockerfile, compose, up, smoke, workflow. ✓
 
 **Known unknowns to confirm during Task 1-2 (flagged, not guessed):**
 - Exact `--help`-verified flag spellings for api-server/scheduler/controller-manager (fact-sheet sourced them from the fork manifests + `--help`; re-confirm at implement time and adjust if a flag name differs).
 - Whether the fork's api-server `/app/entrypoint.sh` wrapper matters — we `COPY /app/api-server` and invoke it directly (bypassing the wrapper), so it should not; confirm the binary runs standalone.
-- containerd-rs inside DinD may need extra cgroup/mount setup beyond `--privileged` (kind mounts cgroup2 + sets `no_pivot_root`, which our config sets). If sandbox creation fails, add the cgroup2 mount + `/dev` setup to `entrypoint.sh` `start_containerd_rs` (this is the M1-proven area).
+- containerd-rs-in-DinD requirements are now RESOLVED against the fork's proven harness (`scripts/k0s-diff/compose.k0s-v0.yml` + `containerd-rs.toml` on `main`): `cgroup: host` + `tmpfs: /run` on the node services, `/etc/machine-id` generation, `CONTAINERD_RS_INSECURE_REGISTRIES` env for HTTP pulls, `iproute2` in the image, and the aligned config toml (127.0.0.1:10010 stream, `/etc/cni/net.d` conf dir, no `no_pivot_root`). If sandbox creation still fails, diff against that harness first.
