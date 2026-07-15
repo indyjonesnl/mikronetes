@@ -66,11 +66,24 @@ jobs:
         if: failure()
         run: |
           set +e
+          kc() { kubectl --server https://10.88.0.2:6443 --insecure-skip-tls-verify --token dummy "$@"; }
           docker ps -a
           for c in node-1 node-2 node-3; do
-            echo "::group::logs $c"; docker logs "$(docker compose -f compose.dind.yml ps -q $c)" 2>&1 | tail -120; echo "::endgroup::"
+            cid=$(docker compose -f compose.dind.yml ps -q $c)
+            echo "::group::logs $c"; docker logs "$cid" 2>&1 | tail -120; echo "::endgroup::"
+            echo "::group::net $c"
+            docker exec "$cid" sh -c 'ip route | grep 10.244; echo "--- nat KUBE rules:"; iptables -t nat -S 2>/dev/null | grep -c KUBE; echo "--- ip_forward:"; cat /proc/sys/net/ipv4/ip_forward' 2>&1
+            echo "::endgroup::"
           done
-          kubectl --server https://10.88.0.2:6443 --insecure-skip-tls-verify --token dummy get nodes,pods -A -o wide
+          echo "::group::cluster state"
+          kc get nodes,pods -A -o wide
+          kc get endpointslices -A -o wide
+          echo "::endgroup::"
+          echo "::group::flannel logs"
+          for p in $(kc get pods -n kube-flannel -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "-- $p"; kc logs -n kube-flannel "$p" 2>&1 | tail -40
+          done
+          echo "::endgroup::"
 
       - name: Teardown
         if: always()

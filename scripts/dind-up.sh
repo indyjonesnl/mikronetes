@@ -71,5 +71,16 @@ for _ in $(seq 1 90); do
 done
 [ "$(kc get pods -l app=whoami --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}' | wc -w)" -ge 2 ] || {
   echo "fewer than 2 whoami pods Running" >&2; kc get pods -l app=whoami -o wide >&2; exit 1; }
+
+# The Service must have BOTH pod IPs as ready endpoints before the smoke probes
+# LB, else a probe racing endpoint registration sees a single backend.
+say "waiting for 2 ready endpoints on the whoami Service"
+eps() { kc get endpointslices -l kubernetes.io/service-name=whoami \
+  -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' 2>/dev/null | sort -u | grep -c .; }
+for _ in $(seq 1 60); do [ "$(eps)" -ge 2 ] && break; sleep 3; done
+[ "$(eps)" -ge 2 ] || {
+  echo "whoami Service has fewer than 2 ready endpoints" >&2
+  kc get endpointslices -l kubernetes.io/service-name=whoami -o wide >&2; exit 1; }
+
 kc get nodes,pods -A -o wide || true
 say "dind cluster up"
