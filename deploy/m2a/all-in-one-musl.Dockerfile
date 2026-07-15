@@ -1,0 +1,202 @@
+# syntax=docker/dockerfile:1.6
+# Musl-static all-in-one rusternetes binary for the M2a microVM overlay.
+#
+# Wraps rusternetes/all-in-one.Dockerfile with two fixes applied:
+#   1. Uses rust:1.95-alpine (musl toolchain by default) so the output binary
+#      is statically linked against musl — required for the Alpine initramfs.
+#   2. Adds `test_support` to the CRATE-ENUMERATION (2/3) dummy stub block,
+#      which is missing from the upstream Dockerfile and causes "no targets
+#      specified" at cargo build time.
+#
+# Build context is the PARENT directory of rusternetes/ (same as upstream):
+#   docker build -f mikronetes/deploy/m2a/all-in-one-musl.Dockerfile \
+#                -t mikronetes-aio:m2a /home/jones/PhpstormProjects
+#
+# aws-lc-rs requires cmake + C compiler; alpine provides them via build-base
+# and cmake. The ring/aws-lc-rs crypto is compiled against musl libc.
+#
+# Output: /app/rusternetes (musl-static ELF, verified by `file` == "static-pie")
+
+# Stage 1: Build the console SPA (unchanged from upstream)
+FROM node:24-slim AS console-builder
+WORKDIR /console
+COPY rusternetes/console/package.json rusternetes/console/package-lock.json* ./
+RUN npm ci --ignore-scripts
+COPY rusternetes/console/ ./
+RUN npm run build
+
+# Stage 2: Musl-static Rust binary.
+#
+# rust:1.95-alpine compiles with the x86_64-unknown-linux-musl target by
+# default (that is the host triple on Alpine). All deps link against musl.
+FROM rust:1.95-alpine AS builder
+
+# Build deps: protobuf-compiler (for tonic-build), cmake + C toolchain (for
+# aws-lc-sys), sccache for BuildKit cache re-use across builds.
+ARG SCCACHE_VERSION=v0.8.2
+RUN apk add --no-cache \
+    protobuf \
+    protobuf-dev \
+    cmake \
+    build-base \
+    perl \
+    curl \
+    git \
+ && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+        | tar -xz -C /tmp \
+ && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
+ && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache \
+    SCCACHE_CACHE_SIZE=20G \
+    SCCACHE_IDLE_TIMEOUT=0 \
+    CARGO_INCREMENTAL=0 \
+    # Force libz-sys to link zlib statically (flate2 dep) so the output binary
+    # has no dynamic shared-library dependencies and runs in the Alpine initramfs.
+    LIBZ_SYS_STATIC=1
+
+WORKDIR /build
+
+# Copy the rhino submodule first (dependency). Sits at /build/rusternetes/rhino
+# so the relative path ../../rhino from /build/rusternetes/crates/storage resolves.
+COPY rusternetes/rhino/Cargo.toml rusternetes/rhino/Cargo.lock rusternetes/rhino/build.rs ./rusternetes/rhino/
+COPY rusternetes/rhino/proto/ ./rusternetes/rhino/proto/
+COPY rusternetes/rhino/src/   ./rusternetes/rhino/src/
+
+# ----- PASS 1: dependency-only compile (cache-friendly) -----
+
+COPY rusternetes/Cargo.toml rusternetes/Cargo.lock* ./rusternetes/
+
+# CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
+COPY rusternetes/crates/admission-webhook/Cargo.toml  ./rusternetes/crates/admission-webhook/Cargo.toml
+COPY rusternetes/crates/api-server/Cargo.toml         ./rusternetes/crates/api-server/Cargo.toml
+COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud-providers/Cargo.toml
+COPY rusternetes/crates/client/Cargo.toml             ./rusternetes/crates/client/Cargo.toml
+COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
+COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
+COPY rusternetes/crates/cri/Cargo.toml                ./rusternetes/crates/cri/Cargo.toml
+COPY rusternetes/crates/discovery/Cargo.toml          ./rusternetes/crates/discovery/Cargo.toml
+COPY rusternetes/crates/dns/Cargo.toml                ./rusternetes/crates/dns/Cargo.toml
+COPY rusternetes/crates/kubectl/Cargo.toml            ./rusternetes/crates/kubectl/Cargo.toml
+COPY rusternetes/crates/kubelet/Cargo.toml            ./rusternetes/crates/kubelet/Cargo.toml
+COPY rusternetes/crates/kube-proxy/Cargo.toml         ./rusternetes/crates/kube-proxy/Cargo.toml
+COPY rusternetes/crates/middleware/Cargo.toml         ./rusternetes/crates/middleware/Cargo.toml
+COPY rusternetes/crates/protobuf/Cargo.toml           ./rusternetes/crates/protobuf/Cargo.toml
+COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/rusternetes/Cargo.toml
+COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
+COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
+COPY rusternetes/crates/streamproxy/Cargo.toml        ./rusternetes/crates/streamproxy/Cargo.toml
+COPY rusternetes/crates/test_support/Cargo.toml       ./rusternetes/crates/test_support/Cargo.toml
+
+COPY rusternetes/crates/api-server/build.rs ./rusternetes/crates/api-server/build.rs
+COPY rusternetes/crates/api-server/proto    ./rusternetes/crates/api-server/proto
+COPY rusternetes/crates/common/build.rs     ./rusternetes/crates/common/build.rs
+COPY rusternetes/crates/cri/build.rs        ./rusternetes/crates/cri/build.rs
+COPY rusternetes/crates/cri/proto           ./rusternetes/crates/cri/proto
+
+# CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
+# FIX vs upstream: adds test_support to the lib-only stubs (was missing,
+# caused "no targets specified in the manifest" at cargo build time).
+RUN set -eux; \
+    cd /build/rusternetes; \
+    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy test_support; do \
+        mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
+    done; \
+    for c in kubectl rusternetes; do \
+        mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
+    done; \
+    for c in api-server controller-manager dns kubelet kube-proxy scheduler; do \
+        mkdir -p crates/$c/src && \
+        : > crates/$c/src/lib.rs && \
+        echo "fn main(){}" > crates/$c/src/main.rs; \
+    done
+
+# Dummy bench files.
+RUN mkdir -p /build/rusternetes/crates/common/benches \
+ && echo "fn main(){}" > /build/rusternetes/crates/common/benches/regex_cache.rs \
+ && mkdir -p /build/rusternetes/crates/storage/benches \
+ && echo "fn main(){}" > /build/rusternetes/crates/storage/benches/watch_latency.rs
+
+ARG CARGO_FEATURES=sqlite
+WORKDIR /build/rusternetes
+
+# Pass 1: compile dep graph with dummy sources.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/rusternetes/target \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes-musl,sharing=locked \
+    cargo build --profile release-fast --features ${CARGO_FEATURES} -p rusternetes \
+ && cargo clean --profile release-fast \
+        -p rusternetes-admission-webhook \
+        -p rusternetes-api-server \
+        -p rusternetes-client \
+        -p rusternetes-cloud-providers \
+        -p rusternetes-common \
+        -p rusternetes-controller-manager \
+        -p rusternetes-cri \
+        -p rusternetes-discovery \
+        -p rusternetes-dns \
+        -p rusternetes-kubectl \
+        -p rusternetes-kubelet \
+        -p rusternetes-kube-proxy \
+        -p rusternetes-middleware \
+        -p rusternetes-protobuf \
+        -p rusternetes \
+        -p rusternetes-scheduler \
+        -p rusternetes-storage \
+        -p rusternetes-streamproxy \
+        -p rusternetes-test-support \
+ && sccache --show-stats
+
+# ----- PASS 2: real source compile -----
+
+COPY rusternetes/crates/admission-webhook/src    ./crates/admission-webhook/src
+COPY rusternetes/crates/api-server/src           ./crates/api-server/src
+COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
+COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
+COPY rusternetes/crates/client/src               ./crates/client/src
+COPY rusternetes/crates/common/src               ./crates/common/src
+COPY rusternetes/crates/common/tests             ./crates/common/tests
+COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src
+COPY rusternetes/crates/controller-manager/tests ./crates/controller-manager/tests
+COPY rusternetes/crates/cri/src                  ./crates/cri/src
+COPY rusternetes/crates/discovery/src            ./crates/discovery/src
+COPY rusternetes/crates/dns/src                  ./crates/dns/src
+COPY rusternetes/crates/kubectl/src              ./crates/kubectl/src
+COPY rusternetes/crates/kubectl/tests            ./crates/kubectl/tests
+COPY rusternetes/crates/kubelet/src              ./crates/kubelet/src
+COPY rusternetes/crates/kubelet/tests            ./crates/kubelet/tests
+COPY rusternetes/crates/kube-proxy/src           ./crates/kube-proxy/src
+COPY rusternetes/crates/kube-proxy/tests         ./crates/kube-proxy/tests
+COPY rusternetes/crates/middleware/src           ./crates/middleware/src
+COPY rusternetes/crates/protobuf/src             ./crates/protobuf/src
+COPY rusternetes/crates/rusternetes/src          ./crates/rusternetes/src
+COPY rusternetes/crates/scheduler/src            ./crates/scheduler/src
+COPY rusternetes/crates/scheduler/tests          ./crates/scheduler/tests
+COPY rusternetes/crates/storage/src              ./crates/storage/src
+COPY rusternetes/crates/streamproxy/src          ./crates/streamproxy/src
+COPY rusternetes/crates/test_support/src         ./crates/test_support/src
+
+ARG RUSTERNETES_GIT_SHA=""
+ENV RUSTERNETES_GIT_SHA=${RUSTERNETES_GIT_SHA}
+
+# Pass 2: rebuild with real sources → musl-static binary.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/rusternetes/target \
+    --mount=type=cache,target=/sccache,id=sccache-rusternetes-musl,sharing=locked \
+    cargo build --profile release-fast --features ${CARGO_FEATURES} -p rusternetes && \
+    sccache --show-stats && \
+    mkdir -p /out && cp target/release-fast/rusternetes /out/rusternetes
+
+# Stage 3: Minimal scratch/alpine runtime — no glibc.
+# We use alpine only to get a shell for docker cp; the binary itself is static.
+FROM alpine:3.21
+
+WORKDIR /app
+COPY --from=builder /out/rusternetes /app/rusternetes
+
+EXPOSE 6443 10250
+ENTRYPOINT ["/app/rusternetes"]
+CMD ["--storage-backend", "sqlite", "--tls", "--console-dir", "/app/console"]

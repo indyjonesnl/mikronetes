@@ -1,0 +1,15 @@
+root = "/var/lib/containerd-rs"
+state = "/run/containerd-rs"
+cri_socket = "/run/containerd-rs.sock"
+stream_server_address = "0.0.0.0:10010"
+
+[cri]
+sandbox_image = "registry.k8s.io/pause:3.10"
+default_runtime_name = "crun"
+runtime_type = "io.containerd.crun.v2"
+snapshotter = "overlayfs"
+systemd_cgroup = false
+registry_config_path = "/boot/certs.d"
+cni_conf_dir = "/boot/cni/conf"
+cni_bin_dir = "/boot/cni/bin"
+no_pivot_root = true

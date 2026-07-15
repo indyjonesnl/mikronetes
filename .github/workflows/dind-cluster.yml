@@ -1,0 +1,134 @@
+name: dind-cluster
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rusternetes_image_tag:
+        description: 'rusternetes fork image tag to consume'
+        default: 'main'
+
+concurrency:
+  group: dind-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dind:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      RUSTERNETES_IMAGE_TAG: ${{ github.event.inputs.rusternetes_image_tag || 'main' }}
+    steps:
+      - name: Checkout mikronetes
+        uses: actions/checkout@v4
+
+      - name: Checkout rusternetes (bootstrap-cluster.yaml; public, no token)
+        uses: actions/checkout@v4
+        with:
+          repository: indyjonesnl/rusternetes
+          ref: main
+          path: rusternetes-src
+
+      - name: Ensure kubectl
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            v=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+            curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${v}/bin/linux/${{ matrix.arch }}/kubectl"
+            sudo install -m0755 /tmp/kubectl /usr/local/bin/kubectl
+          fi
+          kubectl version --client
+
+      - name: Allow cross-node pod traffic (DinD host-gw)
+        # flannel host-gw routes pod-subnet (10.244.0.0/16) traffic between the
+        # node containers as bridged frames on the compose network. GitHub
+        # runners set the host FORWARD policy to DROP (Docker), and with
+        # br_netfilter those bridged frames traverse the host firewall and get
+        # dropped — so cross-node pod-to-pod (and thus Service LB across
+        # distinct workers) fails. Accept the pod CIDR early in DOCKER-USER, as
+        # kind and other DinD-k8s CIs do. (Local dev hosts with FORWARD ACCEPT
+        # don't need this, which is why it only bites on the runner.)
+        run: |
+          set -euxo pipefail
+          sudo iptables -I DOCKER-USER -s 10.244.0.0/16 -j ACCEPT
+          sudo iptables -I DOCKER-USER -d 10.244.0.0/16 -j ACCEPT
+
+      - name: Build the node image (COPY-only, native arch)
+        run: |
+          set -euxo pipefail
+          docker build -f deploy/dind/node.Dockerfile \
+            --build-arg CNI_ARCH=${{ matrix.arch }} \
+            --build-arg CRUN_ARCH=${{ matrix.arch }} \
+            --build-arg CONTAINERD_RS_ARCH=${{ matrix.arch }} \
+            --build-arg RUSTERNETES_IMAGE_TAG="${RUSTERNETES_IMAGE_TAG}" \
+            -t mikronetes-node:dind .
+
+      - name: Bring up the cluster
+        env:
+          NODE_IMAGE: mikronetes-node:dind
+          RUSTERNETES_SRC: ${{ github.workspace }}/rusternetes-src
+          POD_PLATFORM: linux/${{ matrix.arch }}
+        run: bash scripts/dind-up.sh
+
+      - name: Smoke (services parity)
+        run: bash scripts/dind-smoke.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          kc() { kubectl --server https://10.88.0.2:6443 --insecure-skip-tls-verify --token dummy "$@"; }
+          echo "::group::host FORWARD / DOCKER-USER"
+          sudo iptables -S FORWARD; sudo iptables -S DOCKER-USER
+          cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null
+          echo "::endgroup::"
+          docker ps -a
+          for c in node-1 node-2 node-3; do
+            cid=$(docker compose -f compose.dind.yml ps -q $c)
+            echo "::group::logs $c"; docker logs "$cid" 2>&1 | tail -120; echo "::endgroup::"
+            echo "::group::net $c"
+            docker exec "$cid" sh -c 'ip route | grep 10.244; echo "--- nat KUBE rules:"; iptables -t nat -S 2>/dev/null | grep -c KUBE; echo "--- ip_forward:"; cat /proc/sys/net/ipv4/ip_forward' 2>&1
+            echo "::endgroup::"
+          done
+          echo "::group::cluster state"
+          kc get nodes,pods -A -o wide
+          kc get endpointslices -A -o wide
+          echo "::endgroup::"
+          echo "::group::flannel logs"
+          for p in $(kc get pods -n kube-flannel -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "-- $p"; kc logs -n kube-flannel "$p" 2>&1 | tail -40
+          done
+          echo "::endgroup::"
+          echo "::group::per-node FORWARD + service nat"
+          for c in node-2 node-3; do
+            cid=$(docker compose -f compose.dind.yml ps -q $c)
+            echo "-- $c FORWARD:"; docker exec "$cid" iptables -S FORWARD 2>&1 | head
+            echo "-- $c nat (service/dnat/masq):"; docker exec "$cid" iptables -t nat -S 2>&1 | grep -iE 'RUSTERNETES|DNAT|MASQUERADE' | head
+          done
+          echo "::endgroup::"
+          echo "::group::direct cross-node pod->pod (bypass Service)"
+          rip=$(kc get pods -l app=whoami -o jsonpath='{range .items[*]}{.spec.nodeName}{" "}{.status.podIP}{"\n"}{end}' | awk '$1=="node-3"{print $2}')
+          echo "remote whoami pod IP on node-3: $rip"
+          kc delete pod xnode --ignore-not-found >/dev/null 2>&1
+          kc apply -f - <<POD
+          apiVersion: v1
+          kind: Pod
+          metadata: { name: xnode }
+          spec:
+            nodeName: node-2
+            restartPolicy: Never
+            containers:
+            - name: c
+              image: 10.88.0.1:5000/busybox:1.36.1
+              command: ["sh","-c","wget -qO- --timeout=8 http://$rip:80 | grep -i hostname || echo XNODE-UNREACHABLE"]
+          POD
+          for _ in $(seq 1 30); do ph=$(kc get pod xnode -o jsonpath='{.status.phase}' 2>/dev/null); { [ "$ph" = Succeeded ] || [ "$ph" = Failed ]; } && break; sleep 2; done
+          echo "xnode phase=$(kc get pod xnode -o jsonpath='{.status.phase}' 2>/dev/null)"; kc logs xnode 2>&1 | tail -3
+          echo "::endgroup::"
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f compose.dind.yml down -v || true

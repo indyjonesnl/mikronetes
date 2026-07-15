@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: whoami, namespace: default }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: whoami } }
+  template:
+    metadata: { labels: { app: whoami } }
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: { matchLabels: { app: whoami } }
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: whoami
+        image: 10.88.0.1:5000/whoami:v1.10.2
+        imagePullPolicy: IfNotPresent
+        ports: [{ containerPort: 80 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: whoami, namespace: default }
+spec:
+  selector: { app: whoami }
+  ports: [{ port: 80, targetPort: 80 }]

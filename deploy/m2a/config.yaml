@@ -1,0 +1,58 @@
+# mikronetes M2a — single all-in-one node. machined supervises containerd-rs
+# (runtime, CRI-health-gated) + the rusternetes all-in-one (embedded kubelet in
+# CNI mode + embedded kube-proxy). A CNI DaemonSet is applied post-boot;
+# flannel-rs is the current default and calico-rs can replace it later.
+machine:
+  hostname: node-1
+  network:
+    interfaces:
+      - name: eth0
+        addresses: ["10.88.0.2/24"]
+        routes:
+          - via: 10.88.0.1
+    nameservers: [10.88.0.1]
+  install:
+    disk: /dev/vda
+    wipe: false
+  runtime:
+    disabled: false
+    binary: /boot/bin/containerd-rs
+    socket: /run/containerd-rs.sock
+    config_path: /boot/config-containerd-rs.toml   # baked → machined won't overwrite
+  services:
+    - id: rusternetes
+      # Argv/env are A1-PROVEN verbatim (the embedded kubelet drove containerd-rs
+      # with exactly these). --disable-dns: no CoreDNS needed for the M2a smoke.
+      command:
+        - /boot/bin/rusternetes
+        - --storage-backend
+        - sqlite
+        - --data-dir
+        - /var/lib/rusternetes/db
+        - --tls
+        - --tls-cert-file
+        - /boot/pki/k8s/server.crt
+        - --tls-key-file
+        - /boot/pki/k8s/server.key
+        - --bind-address
+        - 0.0.0.0:6443
+        - --node-name
+        - node-1
+        - --skip-auth
+        - --disable-proxy        # A1 ran with this; E2 MUST re-enable if the selected CNI needs the kubernetes Service ClusterIP route
+        - --disable-dns
+        - --volume-dir
+        - /var/lib/rusternetes/volumes     # absolute path; default ./data/volumes is relative to CWD (/)
+      depends_on: [containerd]      # gated on CRI RuntimeReady (see boot.rs RuntimeReadiness)
+      restart: always
+      env:
+        - { key: RUST_LOG, value: info }
+        - { key: RUST_MIN_STACK, value: "8388608" }
+        - { key: PATH, value: "/boot/bin:/usr/bin:/bin" }
+        - { key: CONTAINER_RUNTIME_ENDPOINT, value: "unix:///run/containerd-rs.sock" }
+        # M2a E2: stable PKI baked onto /boot/pki/k8s/ (subdirectory avoids
+        # collision with machined's own PKI files at /boot/pki/ written by
+        # machined-imager --pki-dir). resolve_ca_cert_pem() finds ca.crt as a
+        # sibling of server.crt and embeds it in SA token secrets +
+        # kube-root-ca.crt ConfigMaps. CNI controllers use ca.crt (from their
+        # SA token) to verify the API server TLS cert across restarts.

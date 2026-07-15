@@ -3,3 +3,6 @@
 
 # Rust
 /target/
+
+# M2a build artifacts
+/out/

@@ -1,0 +1,53 @@
+name: mikronetes-dind
+networks:
+  mikronetes-net:
+    driver: bridge
+    # Gateway pinned off .1: containerd-rs's baked config (Task 1,
+    # deploy/dind/config-containerd-rs.toml) hardcodes the registry at
+    # 10.88.0.1:5000 (sandbox_image + node entrypoint.sh REGISTRY default), so
+    # the registry service below must own 10.88.0.1. Docker's bridge driver
+    # otherwise auto-assigns the subnet's first address (.1) as the network
+    # gateway, which collides with that static IP — pin the gateway to .254
+    # to free .1 for the registry container.
+    ipam: { config: [{ subnet: 10.88.0.0/24, gateway: 10.88.0.254 }] }
+# `cgroup: host`, `tmpfs: /run`, and the `dns:` override mirror the fork's
+# proven containerd-rs-in-a-container harness (scripts/k0s-diff/compose.k0s-v0.yml):
+# containerd-rs + crun need host cgroup access + a writable /run, and the dns
+# override avoids the kind-style resolv.conf rewrite. registry publishes 5000 on
+# the host loopback so `dind-up.sh` can seed it with a plain `docker push`.
+services:
+  registry:
+    image: registry:2
+    ports: [ "127.0.0.1:5000:5000" ]
+    networks: { mikronetes-net: { ipv4_address: 10.88.0.1 } }
+  node-1:
+    image: ${NODE_IMAGE:-mikronetes-node:dind}
+    privileged: true
+    cgroup: host
+    hostname: node-1
+    environment: { ROLE: control-plane, NODE_NAME: node-1 }
+    tmpfs: [ /run ]
+    dns: [ 8.8.8.8, 1.1.1.1 ]
+    networks: { mikronetes-net: { ipv4_address: 10.88.0.2 } }
+  node-2:
+    image: ${NODE_IMAGE:-mikronetes-node:dind}
+    privileged: true
+    cgroup: host
+    hostname: node-2
+    environment: { ROLE: worker, NODE_NAME: node-2 }
+    tmpfs: [ /run ]
+    dns: [ 8.8.8.8, 1.1.1.1 ]
+    volumes: [ /lib/modules:/lib/modules:ro ]
+    networks: { mikronetes-net: { ipv4_address: 10.88.0.3 } }
+    depends_on: [ node-1 ]
+  node-3:
+    image: ${NODE_IMAGE:-mikronetes-node:dind}
+    privileged: true
+    cgroup: host
+    hostname: node-3
+    environment: { ROLE: worker, NODE_NAME: node-3 }
+    tmpfs: [ /run ]
+    dns: [ 8.8.8.8, 1.1.1.1 ]
+    volumes: [ /lib/modules:/lib/modules:ro ]
+    networks: { mikronetes-net: { ipv4_address: 10.88.0.4 } }
+    depends_on: [ node-1 ]

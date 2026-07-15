@@ -1,0 +1,59 @@
+name: harness-ci
+
+# Lightweight, hermetic gate for the mikronetes M2 harness that runs on stock
+# GitHub-hosted runners (no KVM, no microVMs, no external images):
+#   1. bash -n syntax check of every harness script
+#   2. shellcheck (advisory)
+#   3. the per-node machine-config generator runs and produces the expected
+#      node configs + kubelet kubeconfig
+#
+# The full M2 four-node microVM smoke needs nested virt (KVM) or emulation and
+# belongs on a self-hosted / ARC runner — that is separate follow-up. This gate
+# guards the harness scripts and config generation, which is where regressions
+# in this repo actually land.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  harness-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n syntax check (all harness scripts)
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in scripts/*.sh; do
+            if bash -n "$f"; then
+              echo "ok  $f"
+            else
+              echo "::error file=$f::bash -n failed"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S error scripts/*.sh
+
+      - name: config generation is hermetic and produces node configs
+        run: |
+          set -euo pipefail
+          OUT="$PWD/out/ci-m2b" bash scripts/m2b-generate-configs.sh
+          for n in node-1 node-2 node-3 node-4; do
+            test -s "out/ci-m2b/configs/$n.yaml" \
+              || { echo "::error::missing/empty config for $n"; exit 1; }
+          done
+          test -s out/ci-m2b/configs/kubelet.kubeconfig \
+            || { echo "::error::missing/empty kubelet.kubeconfig"; exit 1; }
+          echo "generated 4 node configs + kubelet kubeconfig"
