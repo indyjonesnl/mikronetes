@@ -42,6 +42,20 @@ jobs:
           fi
           kubectl version --client
 
+      - name: Allow cross-node pod traffic (DinD host-gw)
+        # flannel host-gw routes pod-subnet (10.244.0.0/16) traffic between the
+        # node containers as bridged frames on the compose network. GitHub
+        # runners set the host FORWARD policy to DROP (Docker), and with
+        # br_netfilter those bridged frames traverse the host firewall and get
+        # dropped — so cross-node pod-to-pod (and thus Service LB across
+        # distinct workers) fails. Accept the pod CIDR early in DOCKER-USER, as
+        # kind and other DinD-k8s CIs do. (Local dev hosts with FORWARD ACCEPT
+        # don't need this, which is why it only bites on the runner.)
+        run: |
+          set -euxo pipefail
+          sudo iptables -I DOCKER-USER -s 10.244.0.0/16 -j ACCEPT
+          sudo iptables -I DOCKER-USER -d 10.244.0.0/16 -j ACCEPT
+
       - name: Build the node image (COPY-only, native arch)
         run: |
           set -euxo pipefail
@@ -67,6 +81,10 @@ jobs:
         run: |
           set +e
           kc() { kubectl --server https://10.88.0.2:6443 --insecure-skip-tls-verify --token dummy "$@"; }
+          echo "::group::host FORWARD / DOCKER-USER"
+          sudo iptables -S FORWARD; sudo iptables -S DOCKER-USER
+          cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null
+          echo "::endgroup::"
           docker ps -a
           for c in node-1 node-2 node-3; do
             cid=$(docker compose -f compose.dind.yml ps -q $c)
