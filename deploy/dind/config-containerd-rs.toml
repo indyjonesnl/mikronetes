@@ -1,0 +1,18 @@
+# Aligned to the fork's PROVEN containerd-rs-in-a-container config
+# (scripts/k0s-diff/containerd-rs.toml on fork main). Insecure registries are
+# supplied via the CONTAINERD_RS_INSECURE_REGISTRIES env (set in entrypoint.sh),
+# NOT a certs.d dir — containerd-rs has no local-image load path, so all images
+# are pulled over HTTP from the local registry.
+root = "/var/lib/containerd-rs"
+state = "/run/containerd-rs"
+cri_socket = "/run/containerd-rs.sock"
+stream_server_address = "127.0.0.1:10010"
+
+[cri]
+sandbox_image = "10.88.0.1:5000/pause:3.10"
+default_runtime_name = "crun"
+runtime_type = "io.containerd.crun.v2"
+snapshotter = "overlayfs"
+systemd_cgroup = false
+cni_conf_dir = "/etc/cni/net.d"
+cni_bin_dir = "/opt/cni/bin"
