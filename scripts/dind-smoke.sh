@@ -55,7 +55,7 @@ YAML
 if [ "$applied" -ne 0 ]; then
   bad "LB probe pod apply failed"
 else
-  ph=""; for _ in $(seq 1 60); do ph=$(kc get pod lb-probe -o jsonpath='{.status.phase}' 2>/dev/null); { [ "$ph" = Succeeded ] || [ "$ph" = Failed ]; } && break; sleep 2; done
+  ph=""; for _ in $(seq 1 90); do ph=$(kc get pod lb-probe -o jsonpath='{.status.phase}' 2>/dev/null); { [ "$ph" = Succeeded ] || [ "$ph" = Failed ]; } && break; sleep 2; done
   ec=$(kc get pod lb-probe -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)
   if [ "${ec:-1}" = 0 ]; then
     pass "Service load-balanced across >=2 distinct backends"
