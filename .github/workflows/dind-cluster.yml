@@ -102,6 +102,32 @@ jobs:
             echo "-- $p"; kc logs -n kube-flannel "$p" 2>&1 | tail -40
           done
           echo "::endgroup::"
+          echo "::group::per-node FORWARD + service nat"
+          for c in node-2 node-3; do
+            cid=$(docker compose -f compose.dind.yml ps -q $c)
+            echo "-- $c FORWARD:"; docker exec "$cid" iptables -S FORWARD 2>&1 | head
+            echo "-- $c nat (service/dnat/masq):"; docker exec "$cid" iptables -t nat -S 2>&1 | grep -iE 'RUSTERNETES|DNAT|MASQUERADE' | head
+          done
+          echo "::endgroup::"
+          echo "::group::direct cross-node pod->pod (bypass Service)"
+          rip=$(kc get pods -l app=whoami -o jsonpath='{range .items[*]}{.spec.nodeName}{" "}{.status.podIP}{"\n"}{end}' | awk '$1=="node-3"{print $2}')
+          echo "remote whoami pod IP on node-3: $rip"
+          kc delete pod xnode --ignore-not-found >/dev/null 2>&1
+          kc apply -f - <<POD
+          apiVersion: v1
+          kind: Pod
+          metadata: { name: xnode }
+          spec:
+            nodeName: node-2
+            restartPolicy: Never
+            containers:
+            - name: c
+              image: 10.88.0.1:5000/busybox:1.36.1
+              command: ["sh","-c","wget -qO- --timeout=8 http://$rip:80 | grep -i hostname || echo XNODE-UNREACHABLE"]
+          POD
+          for _ in $(seq 1 30); do ph=$(kc get pod xnode -o jsonpath='{.status.phase}' 2>/dev/null); { [ "$ph" = Succeeded ] || [ "$ph" = Failed ]; } && break; sleep 2; done
+          echo "xnode phase=$(kc get pod xnode -o jsonpath='{.status.phase}' 2>/dev/null)"; kc logs xnode 2>&1 | tail -3
+          echo "::endgroup::"
 
       - name: Teardown
         if: always()
