@@ -1,0 +1,77 @@
+name: dind-cluster
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rusternetes_image_tag:
+        description: 'rusternetes fork image tag to consume'
+        default: 'main'
+
+concurrency:
+  group: dind-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dind:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      RUSTERNETES_IMAGE_TAG: ${{ github.event.inputs.rusternetes_image_tag || 'main' }}
+    steps:
+      - name: Checkout mikronetes
+        uses: actions/checkout@v4
+
+      - name: Checkout rusternetes (bootstrap-cluster.yaml; public, no token)
+        uses: actions/checkout@v4
+        with:
+          repository: indyjonesnl/rusternetes
+          ref: main
+          path: rusternetes-src
+
+      - name: Ensure kubectl
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            v=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+            curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${v}/bin/linux/${{ matrix.arch }}/kubectl"
+            sudo install -m0755 /tmp/kubectl /usr/local/bin/kubectl
+          fi
+          kubectl version --client
+
+      - name: Build the node image (COPY-only, native arch)
+        run: |
+          set -euxo pipefail
+          docker build -f deploy/dind/node.Dockerfile \
+            --build-arg CNI_ARCH=${{ matrix.arch }} \
+            --build-arg CRUN_ARCH=${{ matrix.arch }} \
+            --build-arg CONTAINERD_RS_ARCH=${{ matrix.arch }} \
+            --build-arg RUSTERNETES_IMAGE_TAG="${RUSTERNETES_IMAGE_TAG}" \
+            -t mikronetes-node:dind .
+
+      - name: Bring up the cluster
+        env:
+          NODE_IMAGE: mikronetes-node:dind
+          RUSTERNETES_SRC: ${{ github.workspace }}/rusternetes-src
+          POD_PLATFORM: linux/${{ matrix.arch }}
+        run: bash scripts/dind-up.sh
+
+      - name: Smoke (services parity)
+        run: bash scripts/dind-smoke.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          docker ps -a
+          for c in node-1 node-2 node-3; do
+            echo "::group::logs $c"; docker logs "$(docker compose -f compose.dind.yml ps -q $c)" 2>&1 | tail -120; echo "::endgroup::"
+          done
+          kubectl --server https://10.88.0.2:6443 --insecure-skip-tls-verify --token dummy get nodes,pods -A -o wide
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f compose.dind.yml down -v || true
