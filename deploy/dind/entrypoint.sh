@@ -49,8 +49,14 @@ case "$ROLE" in
       --insecure-skip-tls-verify --root-dir /var/lib/rusternetes/kubelet \
       --volume-dir /var/lib/rusternetes/volumes --cluster-dns 10.96.0.10 \
       --eviction-hard "" >/var/log/rusternetes/kubelet.log 2>&1 &
+    # --cluster-cidr is the SERVICE (ClusterIP) CIDR, not the pod CIDR — it
+    # scopes kube-proxy's POSTROUTING MASQUERADE for DNAT'd service traffic. It
+    # MUST be the service range (10.96.0.0/12) so cross-node ClusterIP traffic
+    # is masqueraded to the node IP; with the pod CIDR here the masq rule keys
+    # on ctorigdst 10.244/16, never matches a ClusterIP, and cross-node Service
+    # LB breaks (remote backend's reply can't return). Default is 10.96.0.0/12.
     kube-proxy --node-name "$NODE_NAME" --kubeconfig "$KCFG" --api-server-url "$CP" \
-      --insecure-skip-tls-verify --cluster-cidr 10.244.0.0/16 \
+      --insecure-skip-tls-verify --cluster-cidr 10.96.0.0/12 \
       >/var/log/rusternetes/kube-proxy.log 2>&1 &
     ;;
   *) echo "unknown ROLE=$ROLE" >&2; exit 2 ;;
